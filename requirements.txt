@@ -1,0 +1,6 @@
+gymnasium
+numpy
+matplotlib
+scipy
+stable-baselines3
+tensorboard
