@@ -28,11 +28,14 @@ def line_hits_obstacle(x1, y1, x2, y2, obstacle):
     Args:
         x1, y1: Start point
         x2, y2: End point  
-        obstacle: [x_min, y_min, x_max, y_max] bounding box
+        obstacle: [x_min, y_min, x_max, y_max] bounding box, or None
     
     Returns:
         True if line intersects obstacle, False otherwise
     """
+    if obstacle is None:
+        return False
+    
     ox_min, oy_min, ox_max, oy_max = obstacle
     
     # Check multiple points along the line
@@ -75,9 +78,10 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacle):
             return dist
         
         # Check obstacle
-        ox_min, oy_min, ox_max, oy_max = obstacle
-        if ox_min <= px <= ox_max and oy_min <= py <= oy_max:
-            return dist
+        if obstacle is not None:
+            ox_min, oy_min, ox_max, oy_max = obstacle
+            if ox_min <= px <= ox_max and oy_min <= py <= oy_max:
+                return dist
         
         dist += step_size
     
@@ -236,7 +240,7 @@ class Worms3DEnv(gym.Env):
     # Grid size
     SIZE = 30
     
-    # Obstacle: square box in center [x_min, y_min, x_max, y_max]
+    # Obstacle: None for open arena, or [x_min, y_min, x_max, y_max]
     OBSTACLE = [10, 10, 20, 20]  # 10x10 box in center
     
     # Actions: 0=nothing, 1=up, 2=down, 3=left, 4=right, 5=rotate_left, 6=rotate_right, 7=shoot
@@ -260,32 +264,35 @@ class Worms3DEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
-        # Random spawn with minimum distance, avoiding obstacle
-        positions = []
-        for i in range(2):
-            while True:
-                x = self.np_random.uniform(2, self.SIZE - 2)
-                y = self.np_random.uniform(2, self.SIZE - 2)
-                # Check not inside obstacle
-                if self._point_in_obstacle(x, y):
-                    continue
-                # Check distance from other agents
-                if all(np.sqrt((x - px)**2 + (y - py)**2) > 5 for px, py in positions):
-                    positions.append((x, y))
-                    break
+        # Spawn agents on opposite sides of arena
+        # Agent 0 on left side, Agent 1 on right side
+        margin = 5
+        y_center = self.SIZE / 2
+        
+        pos0 = np.array([margin, y_center])
+        pos1 = np.array([self.SIZE - margin, y_center])
+        
+        # Calculate angle to face each other, then add random offset
+        # Agent 0 should face right (0), Agent 1 should face left (π)
+        # Add random rotation offset of ±45° to ±90° so they need to aim
+        rotation_offset_0 = self.np_random.uniform(-math.pi/2, math.pi/2)
+        rotation_offset_1 = self.np_random.uniform(-math.pi/2, math.pi/2)
+        
+        angle0 = 0 + rotation_offset_0  # Facing right-ish
+        angle1 = math.pi + rotation_offset_1  # Facing left-ish
         
         self.agents = [
             {
                 "id": 0, "team": 0, 
-                "pos": np.array([positions[0][0], positions[0][1]]), 
-                "health": MAX_HEALTH, "angle": 0.0, "alive": True,
+                "pos": pos0, 
+                "health": MAX_HEALTH, "angle": angle0, "alive": True,
                 "velocity": np.array([0.0, 0.0]),
                 "ammo": MAX_AMMO, "cooldown": 0
             },
             {
                 "id": 1, "team": 1, 
-                "pos": np.array([positions[1][0], positions[1][1]]), 
-                "health": MAX_HEALTH, "angle": math.pi, "alive": True,
+                "pos": pos1, 
+                "health": MAX_HEALTH, "angle": angle1, "alive": True,
                 "velocity": np.array([0.0, 0.0]),
                 "ammo": MAX_AMMO, "cooldown": 0
             },
@@ -297,6 +304,9 @@ class Worms3DEnv(gym.Env):
         # Step feedback tracking
         self.was_hit = [0.0, 0.0]  # per agent
         self.hit_enemy = [0.0, 0.0]  # per agent
+        
+        # Exploration tracking - visited cells per agent
+        self.visited = [set(), set()]
         
         self.current_step = 0
         return self._get_obs(), {}
@@ -350,62 +360,31 @@ class Worms3DEnv(gym.Env):
             self._handle_collision(agent)
             
             # =================================================================
-            # NEW REWARD SYSTEM
+            # SIMPLE REWARD SYSTEM: Only hits and kills + exploration
             # =================================================================
             
-            # 1. Distance penalty: -0.015 × (distance / diagonal)
-            if enemy["alive"]:
-                dist_to_enemy = np.linalg.norm(agent["pos"] - enemy["pos"])
-                rewards[i] -= 0.015 * (dist_to_enemy / ARENA_DIAGONAL)
-            
-            # 2. Living/time penalty: -0.02 per step
-            rewards[i] -= 0.02
-            
-            # 3. Enemy detected by rays: +0.30 if any ray hits enemy
-            if enemy["alive"]:
-                enemy_in_rays = self._check_enemy_in_rays(agent, enemy)
-                if enemy_in_rays:
-                    rewards[i] += 0.30
-            
-            # 4. Clear line-of-sight bonus: +1.00 if hitscan would hit
-            has_los = False
-            if enemy["alive"]:
-                has_los = self._check_clear_shot(agent, enemy)
-                if has_los:
-                    rewards[i] += 1.00
-            
-            # 5. Shooting cost & conditional bonus
-            if act == 7:  # Shoot action
-                rewards[i] -= 0.04  # Shooting cost
-                if has_los:
-                    rewards[i] += 1.50  # Bonus for shooting with LOS (net +1.46)
+            # Exploration bonus: reward visiting new cells
+            cell = (int(agent["pos"][0]), int(agent["pos"][1]))
+            if cell not in self.visited[i]:
+                self.visited[i].add(cell)
+                rewards[i] += 0.1  # Small bonus for new cell
         
-        # 6. Damage scaling (computed after all actions processed)
+        # Damage rewards (computed after all actions processed)
         for i, agent in enumerate(self.agents):
-            if not agent["alive"] and prev_health[i] > 0:
-                # Just died this step
-                continue
-            
-            # Damage taken this step
-            damage_taken = prev_health[i] - agent["health"]
-            if damage_taken > 0:
-                rewards[i] -= 10.0 * (damage_taken / 100.0)
-            
-            # Damage dealt (check enemy health change)
             enemy = self.agents[1 - i]
+            
+            # Reward for dealing damage: +1.0 per damage point
             enemy_damage = prev_health[1 - i] - enemy["health"]
             if enemy_damage > 0 and self.hit_enemy[i] > 0:
-                rewards[i] += 10.0 * (enemy_damage / 100.0)
-        
-        # 7. Terminal rewards: kill/death
-        for i, agent in enumerate(self.agents):
-            enemy = self.agents[1 - i]
-            # Check if enemy just died (was alive at start, dead now)
+                rewards[i] += enemy_damage  # +25 per hit
+            
+            # Kill bonus
             if prev_health[1 - i] > 0 and not enemy["alive"]:
-                rewards[i] += 80.0  # Kill bonus
-            # Check if agent just died
+                rewards[i] += 1000
+            
+            # Death penalty
             if prev_health[i] > 0 and not agent["alive"]:
-                rewards[i] -= 80.0  # Death penalty
+                rewards[i] -= 1000
 
         # Track steps
         self.current_step = getattr(self, 'current_step', 0) + 1
@@ -550,6 +529,8 @@ class Worms3DEnv(gym.Env):
 
     def _point_in_obstacle(self, x, y):
         """Check if point is inside the obstacle."""
+        if self.OBSTACLE is None:
+            return False
         ox_min, oy_min, ox_max, oy_max = self.OBSTACLE
         return ox_min <= x <= ox_max and oy_min <= y <= oy_max
     

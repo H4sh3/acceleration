@@ -1,12 +1,28 @@
 import sys
 import os
+import glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import time
 import pygame
 import numpy as np
 import math
 
-MODEL_NAME = "models/run_20251128_164517/checkpoint_1700000_steps.zip"
+
+def get_newest_model(models_dir="models"):
+    """Find the newest .zip model file in the models directory."""
+    pattern = os.path.join(models_dir, "**", "*.zip")
+    model_files = glob.glob(pattern, recursive=True)
+    
+    if not model_files:
+        raise FileNotFoundError(f"No .zip model files found in {models_dir}")
+    
+    # Sort by modification time, newest first
+    newest = max(model_files, key=os.path.getmtime)
+    print(f"Using newest model: {newest}")
+    return newest
+
+
+MODEL_PATH = get_newest_model()
 
 # Colors
 BLACK = (0, 0, 0)
@@ -126,12 +142,13 @@ class PygameRenderer:
         for y in range(0, self.screen_height, self.scale * 5):
             pygame.draw.line(self.screen, GRAY, (0, y), (self.screen_width, y), 1)
         
-        # Draw obstacle (brown box)
-        ox1, oy1 = self.world_to_screen(self.obstacle[0], self.obstacle[3])  # Top-left in screen
-        ox2, oy2 = self.world_to_screen(self.obstacle[2], self.obstacle[1])  # Bottom-right in screen
-        obstacle_rect = pygame.Rect(ox1, oy1, ox2 - ox1, oy2 - oy1)
-        pygame.draw.rect(self.screen, (101, 67, 33), obstacle_rect)  # Dark brown fill
-        pygame.draw.rect(self.screen, BLACK, obstacle_rect, 3)  # Black border
+        # Draw obstacle (brown box) if present
+        if self.obstacle is not None:
+            ox1, oy1 = self.world_to_screen(self.obstacle[0], self.obstacle[3])  # Top-left in screen
+            ox2, oy2 = self.world_to_screen(self.obstacle[2], self.obstacle[1])  # Bottom-right in screen
+            obstacle_rect = pygame.Rect(ox1, oy1, ox2 - ox1, oy2 - oy1)
+            pygame.draw.rect(self.screen, (101, 67, 33), obstacle_rect)  # Dark brown fill
+            pygame.draw.rect(self.screen, BLACK, obstacle_rect, 3)  # Black border
         
         # Draw shots (laser beams)
         if shots:
@@ -455,10 +472,9 @@ def run_with_pygame_renderer():
         obstacle=unwrapped.OBSTACLE
     )
     
-    # Load model if exists
+    # Load newest model
     model = None
-    # model_path = "models/worms_final_model.zip"
-    model_path = f"models/{MODEL_NAME}"
+    model_path = MODEL_PATH
     
     if os.path.exists(model_path):
         print(f"Loading model from {model_path}")
