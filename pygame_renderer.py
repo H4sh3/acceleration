@@ -6,6 +6,8 @@ import pygame
 import numpy as np
 import math
 
+MODEL_NAME = "models/run_20251128_164517/checkpoint_1700000_steps.zip"
+
 # Colors
 BLACK = (0, 0, 0)
 GRAY = (128, 128, 128)
@@ -16,7 +18,7 @@ TEAM_COLORS = [
 ]
 
 class PygameRenderer:
-    def __init__(self, map_width, map_depth, scale=30, show_obs=True):
+    def __init__(self, map_width, map_depth, scale=30, show_obs=True, obstacle=None):
         """
         Top-down 2D renderer for Worms 3D environment.
         
@@ -25,17 +27,19 @@ class PygameRenderer:
             map_depth: Depth of the map in world units  
             scale: Pixels per world unit
             show_obs: Whether to show observation panel
+            obstacle: [x_min, y_min, x_max, y_max] obstacle bounds
         """
         self.map_width = map_width
         self.map_depth = map_depth
         self.scale = scale
         self.show_obs = show_obs
+        self.obstacle = obstacle if obstacle else [10, 10, 20, 20]
         
         self.game_width = map_width * scale
         self.game_height = map_depth * scale
         
-        # Add observation panel width if enabled
-        self.obs_panel_width = 300 if show_obs else 0
+        # Add observation panel width if enabled (wider for side-by-side agents)
+        self.obs_panel_width = 500 if show_obs else 0
         self.screen_width = self.game_width + self.obs_panel_width
         self.screen_height = self.game_height
         
@@ -123,9 +127,8 @@ class PygameRenderer:
             pygame.draw.line(self.screen, GRAY, (0, y), (self.screen_width, y), 1)
         
         # Draw obstacle (brown box)
-        obstacle = [6, 6, 9, 9]  # Match env OBSTACLE
-        ox1, oy1 = self.world_to_screen(obstacle[0], obstacle[3])  # Top-left in screen
-        ox2, oy2 = self.world_to_screen(obstacle[2], obstacle[1])  # Bottom-right in screen
+        ox1, oy1 = self.world_to_screen(self.obstacle[0], self.obstacle[3])  # Top-left in screen
+        ox2, oy2 = self.world_to_screen(self.obstacle[2], self.obstacle[1])  # Bottom-right in screen
         obstacle_rect = pygame.Rect(ox1, oy1, ox2 - ox1, oy2 - oy1)
         pygame.draw.rect(self.screen, (101, 67, 33), obstacle_rect)  # Dark brown fill
         pygame.draw.rect(self.screen, BLACK, obstacle_rect, 3)  # Black border
@@ -176,7 +179,7 @@ class PygameRenderer:
             self.screen.blit(team_label, (sx - 8, sy + radius + 2))
             
             # Draw health bar
-            health_pct = agent["health"] / 200.0
+            health_pct = agent["health"] / 100.0
             bar_width = self.scale
             bar_height = 4
             bar_x = sx - bar_width // 2
@@ -214,39 +217,46 @@ class PygameRenderer:
         pygame.draw.line(self.screen, (100, 100, 100), 
                         (panel_x, 0), (panel_x, self.screen_height), 2)
         
-        # Get latest frame from stacked observation (last 40 dims of 160)
-        # Frame stacking: 4 frames x 40 dims = 160 total
+        # Get latest frame from stacked observation
+        # Frame stacking: 4 frames x 56 dims = 224 total (28 per agent x 2 agents)
         obs = self.current_obs.flatten()
-        if len(obs) >= 160:
-            # Get last frame (most recent)
-            latest_start = 3 * 40  # Index 120
-            obs = obs[latest_start:latest_start + 40]
-        elif len(obs) >= 40:
-            obs = obs[:40]  # Just use first 40 if not stacked
+        agent_obs_dim = 28  # Updated observation dimension per agent
+        total_obs_dim = agent_obs_dim * 2  # 56 for both agents
         
-        # Split into agent 0 and agent 1 observations (20 dims each)
-        obs0 = obs[:20] if len(obs) >= 20 else obs
-        obs1 = obs[20:40] if len(obs) >= 40 else None
+        if len(obs) >= total_obs_dim * 4:
+            # Get last frame (most recent) from stacked obs
+            latest_start = 3 * total_obs_dim
+            obs = obs[latest_start:latest_start + total_obs_dim]
+        elif len(obs) >= total_obs_dim:
+            obs = obs[:total_obs_dim]
         
-        y = 10
+        # Split into agent 0 and agent 1 observations (28 dims each)
+        obs0 = obs[:agent_obs_dim] if len(obs) >= agent_obs_dim else obs
+        obs1 = obs[agent_obs_dim:agent_obs_dim*2] if len(obs) >= agent_obs_dim*2 else None
+        
+        y_start = 10
         
         # Title
         title = self.font.render("OBSERVATION", True, (255, 255, 255))
-        self.screen.blit(title, (panel_x + 10, y))
-        y += 30
+        self.screen.blit(title, (panel_x + 10, y_start))
+        y_start += 30
         
-        # Render each agent's observation
+        # Render agents side by side
+        col_width = 240
         for agent_idx, agent_obs in enumerate([obs0, obs1]):
             if agent_obs is None:
                 continue
             
+            col_x = panel_x + agent_idx * col_width
+            y = y_start
+            
             color = TEAM_COLORS[agent_idx]
             header = self.font.render(f"Agent {agent_idx}", True, color)
-            self.screen.blit(header, (panel_x + 10, y))
+            self.screen.blit(header, (col_x + 10, y))
             y += 22
             
             # Self state (0-5)
-            y = self._draw_obs_section(panel_x, y, "Self State", [
+            y = self._draw_obs_section(col_x, y, "Self State", [
                 ("cos θ", agent_obs[0]),
                 ("sin θ", agent_obs[1]),
                 ("v_fwd", agent_obs[2]),
@@ -256,23 +266,22 @@ class PygameRenderer:
             ])
             
             # Enemy info (6-9)
-            y = self._draw_obs_section(panel_x, y, "Enemy Info", [
+            y = self._draw_obs_section(col_x, y, "Enemy Info", [
                 ("cos Δ", agent_obs[6]),
                 ("sin Δ", agent_obs[7]),
                 ("dist", agent_obs[8]),
                 ("LOS", agent_obs[9]),
             ])
             
-            # Ray sensors (10-17) - draw as mini visualization
-            y = self._draw_ray_viz(panel_x, y, agent_obs[10:18], agent_obs[0], agent_obs[1])
+            # Ray sensors (10-17 wall dist, 20-27 enemy detect) - draw as mini visualization
+            enemy_rays = agent_obs[20:28] if len(agent_obs) >= 28 else [0]*8
+            y = self._draw_ray_viz(col_x, y, agent_obs[10:18], agent_obs[0], agent_obs[1], enemy_rays)
             
             # Step feedback (18-19)
-            y = self._draw_obs_section(panel_x, y, "Feedback", [
+            y = self._draw_obs_section(col_x, y, "Feedback", [
                 ("was_hit", agent_obs[18]),
                 ("hit_enemy", agent_obs[19]),
             ])
-            
-            y += 10  # Space between agents
     
     def _draw_obs_section(self, panel_x, y, title, items):
         """Draw a section of observation values."""
@@ -282,16 +291,16 @@ class PygameRenderer:
         y += 16
         
         # Draw items as horizontal bars
-        bar_width = 80
+        bar_width = 60
         bar_height = 10
         
         for name, value in items:
             # Label
             label = self.small_font.render(f"{name}:", True, (150, 150, 150))
-            self.screen.blit(label, (panel_x + 20, y))
+            self.screen.blit(label, (panel_x + 15, y))
             
             # Value bar
-            bar_x = panel_x + 80
+            bar_x = panel_x + 70
             
             # Background
             pygame.draw.rect(self.screen, (60, 60, 70), 
@@ -310,27 +319,35 @@ class PygameRenderer:
             
             # Numeric value
             val_text = self.small_font.render(f"{value:.2f}", True, (200, 200, 200))
-            self.screen.blit(val_text, (bar_x + bar_width + 5, y))
+            self.screen.blit(val_text, (bar_x + bar_width + 3, y))
             
             y += 14
         
         return y + 2
     
-    def _draw_ray_viz(self, panel_x, y, rays, cos_theta, sin_theta):
-        """Draw ray sensor visualization as a mini radar."""
+    def _draw_ray_viz(self, panel_x, y, rays, cos_theta, sin_theta, enemy_rays=None):
+        """Draw ray sensor visualization as a mini radar.
+        
+        Args:
+            rays: Wall/obstacle distance for each ray (0-1 normalized)
+            enemy_rays: 1.0 if ray detects enemy, 0.0 otherwise
+        """
         # Section title
         text = self.small_font.render("Ray Sensors", True, (180, 180, 180))
         self.screen.blit(text, (panel_x + 15, y))
         y += 18
         
         # Draw mini radar
-        center_x = panel_x + 75
-        center_y = y + 40
-        radius = 35
+        center_x = panel_x + 60
+        center_y = y + 35
+        radius = 30
         
         # Background circle
         pygame.draw.circle(self.screen, (60, 60, 70), (center_x, center_y), radius)
         pygame.draw.circle(self.screen, (100, 100, 110), (center_x, center_y), radius, 1)
+        
+        if enemy_rays is None:
+            enemy_rays = [0] * len(rays)
         
         # Draw rays - 8 rays covering ±90° from heading
         n_rays = len(rays)
@@ -346,16 +363,22 @@ class PygameRenderer:
             end_x = center_x + math.cos(world_angle) * ray_len
             end_y = center_y - math.sin(world_angle) * ray_len
             
-            # Color based on distance (red = close, green = far)
-            r = int(255 * (1 - ray_dist))
-            g = int(255 * ray_dist)
-            color = (r, g, 50)
+            # Color: CYAN if enemy detected, otherwise red/green gradient for distance
+            enemy_hit = enemy_rays[i] > 0.5 if i < len(enemy_rays) else False
+            if enemy_hit:
+                color = (0, 255, 255)  # Cyan = enemy detected
+            else:
+                # Red = close wall, green = far wall
+                r = int(255 * (1 - ray_dist))
+                g = int(255 * ray_dist)
+                color = (r, g, 50)
             
             pygame.draw.line(self.screen, color, (center_x, center_y), 
                            (int(end_x), int(end_y)), 2)
             
-            # Draw endpoint dot
-            pygame.draw.circle(self.screen, color, (int(end_x), int(end_y)), 3)
+            # Draw endpoint dot (larger if enemy)
+            dot_size = 5 if enemy_hit else 3
+            pygame.draw.circle(self.screen, color, (int(end_x), int(end_y)), dot_size)
         
         # Draw agent heading indicator
         head_len = radius + 5
@@ -364,7 +387,7 @@ class PygameRenderer:
         pygame.draw.line(self.screen, (255, 255, 255), (center_x, center_y),
                         (int(head_x), int(head_y)), 2)
         
-        return y + 85
+        return y + 75
     
     def play_history(self, fps=10):
         """
@@ -424,17 +447,18 @@ def run_with_pygame_renderer():
     env = VecFrameStack(env, n_stack=4)
     unwrapped = env.envs[0].unwrapped
     
-    # Create renderer
+    # Create renderer (scale reduced for larger arena)
     renderer = PygameRenderer(
         map_width=unwrapped.SIZE,
         map_depth=unwrapped.SIZE,
-        scale=30
+        scale=20,
+        obstacle=unwrapped.OBSTACLE
     )
     
     # Load model if exists
     model = None
     # model_path = "models/worms_final_model.zip"
-    model_path = "models/worms_model_1070000_steps.zip"
+    model_path = f"models/{MODEL_NAME}"
     
     if os.path.exists(model_path):
         print(f"Loading model from {model_path}")

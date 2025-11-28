@@ -10,8 +10,8 @@ from worms_3d_gym.envs.worms_3d_env import (
     OBS_DIM, MAX_HEALTH, MAX_AMMO, MAX_COOLDOWN, MAX_SPEED_FORWARD, N_RAYS, RAY_MAX_RANGE
 )
 
-ARENA_SIZE = 15
-OBSTACLE = [6, 6, 9, 9]
+ARENA_SIZE = 30
+OBSTACLE = [10, 10, 20, 20]
 
 
 class TestLineHitsObstacle:
@@ -19,23 +19,23 @@ class TestLineHitsObstacle:
     
     def test_line_through_obstacle(self):
         """Line passing through obstacle should return True."""
-        assert line_hits_obstacle(0, 7.5, 15, 7.5, OBSTACLE) is True
+        assert line_hits_obstacle(0, 15, 30, 15, OBSTACLE) is True
     
     def test_line_around_obstacle(self):
         """Line not touching obstacle should return False."""
-        assert line_hits_obstacle(0, 0, 5, 5, OBSTACLE) is False
+        assert line_hits_obstacle(0, 0, 8, 8, OBSTACLE) is False
     
     def test_line_ending_in_obstacle(self):
         """Line ending inside obstacle should return True."""
-        assert line_hits_obstacle(0, 7, 7, 7, OBSTACLE) is True
+        assert line_hits_obstacle(0, 15, 15, 15, OBSTACLE) is True
     
     def test_line_starting_in_obstacle(self):
         """Line starting inside obstacle should return True."""
-        assert line_hits_obstacle(7, 7, 15, 15, OBSTACLE) is True
+        assert line_hits_obstacle(15, 15, 30, 30, OBSTACLE) is True
     
     def test_diagonal_miss(self):
         """Diagonal line missing obstacle should return False."""
-        assert line_hits_obstacle(0, 0, 5, 10, OBSTACLE) is False
+        assert line_hits_obstacle(0, 0, 5, 25, OBSTACLE) is False
 
 
 class TestRayCast:
@@ -43,15 +43,15 @@ class TestRayCast:
     
     def test_ray_hits_wall(self):
         """Ray should hit arena boundary."""
-        # From center, facing right (+x)
-        dist = ray_cast(7.5, 7.5, 0, RAY_MAX_RANGE, ARENA_SIZE, OBSTACLE)
+        # From near edge, facing right (+x)
+        dist = ray_cast(25, 5, 0, RAY_MAX_RANGE, ARENA_SIZE, OBSTACLE)
         assert dist < RAY_MAX_RANGE  # Should hit wall before max range
     
     def test_ray_hits_obstacle(self):
         """Ray should hit obstacle."""
-        # From left side, facing right toward obstacle
-        dist = ray_cast(3, 7.5, 0, RAY_MAX_RANGE, ARENA_SIZE, OBSTACLE)
-        assert dist < 4  # Should hit obstacle at x=6
+        # From left side, facing right toward obstacle at x=12
+        dist = ray_cast(5, 15, 0, RAY_MAX_RANGE, ARENA_SIZE, OBSTACLE)
+        assert dist < 8  # Should hit obstacle at x=12
     
     def test_ray_max_range(self):
         """Ray should return max_range if no hit."""
@@ -85,10 +85,10 @@ class TestComputeAgentObservation:
         }
     
     def test_observation_shape(self, agent, enemy):
-        """Observation should have 20 elements."""
+        """Observation should have 28 elements (20 base + 8 enemy rays)."""
         obs = compute_agent_observation(agent, enemy, OBSTACLE, ARENA_SIZE)
         assert obs.shape == (OBS_DIM,)
-        assert obs.shape == (20,)
+        assert obs.shape == (28,)
         assert obs.dtype == np.float32
     
     # =========================================================================
@@ -188,8 +188,9 @@ class TestComputeAgentObservation:
     
     def test_has_los_blocked(self, agent, enemy):
         """Test line of sight when blocked by obstacle."""
-        agent["pos"] = np.array([3.0, 7.5])
-        enemy["pos"] = np.array([12.0, 7.5])
+        # Obstacle is at [12, 12, 18, 18], so line through y=15 should be blocked
+        agent["pos"] = np.array([5.0, 15.0])
+        enemy["pos"] = np.array([25.0, 15.0])
         obs = compute_agent_observation(agent, enemy, OBSTACLE, ARENA_SIZE)
         assert obs[9] == 0.0  # Blocked by obstacle
     
