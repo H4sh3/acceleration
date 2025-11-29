@@ -34,7 +34,7 @@ TEAM_COLORS = [
 ]
 
 class PygameRenderer:
-    def __init__(self, map_width, map_depth, scale=30, show_obs=True, obstacle=None):
+    def __init__(self, map_width, map_depth, scale=30, show_obs=True, obstacles=None):
         """
         Top-down 2D renderer for Worms 3D environment.
         
@@ -49,7 +49,7 @@ class PygameRenderer:
         self.map_depth = map_depth
         self.scale = scale
         self.show_obs = show_obs
-        self.obstacle = obstacle if obstacle else [10, 10, 20, 20]
+        self.obstacles = obstacles
         
         self.game_width = map_width * scale
         self.game_height = map_depth * scale
@@ -141,11 +141,11 @@ class PygameRenderer:
             pygame.draw.line(self.screen, GRAY, (x, 0), (x, self.screen_height), 1)
         for y in range(0, self.screen_height, self.scale * 5):
             pygame.draw.line(self.screen, GRAY, (0, y), (self.screen_width, y), 1)
-        
-        # Draw obstacle (brown box) if present
-        if self.obstacle is not None:
-            ox1, oy1 = self.world_to_screen(self.obstacle[0], self.obstacle[3])  # Top-left in screen
-            ox2, oy2 = self.world_to_screen(self.obstacle[2], self.obstacle[1])  # Bottom-right in screen
+
+        # Draw obstacles (brown boxes)
+        for obs in self.obstacles:
+            ox1, oy1 = self.world_to_screen(obs[0], obs[3])  # Top-left in screen
+            ox2, oy2 = self.world_to_screen(obs[2], obs[1])  # Bottom-right in screen
             obstacle_rect = pygame.Rect(ox1, oy1, ox2 - ox1, oy2 - oy1)
             pygame.draw.rect(self.screen, (101, 67, 33), obstacle_rect)  # Dark brown fill
             pygame.draw.rect(self.screen, BLACK, obstacle_rect, 3)  # Black border
@@ -469,7 +469,7 @@ def run_with_pygame_renderer():
         map_width=unwrapped.SIZE,
         map_depth=unwrapped.SIZE,
         scale=20,
-        obstacle=unwrapped.OBSTACLE
+        obstacles=unwrapped.OBSTACLES
     )
     
     # Load newest model

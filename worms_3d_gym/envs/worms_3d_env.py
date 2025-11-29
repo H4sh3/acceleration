@@ -22,34 +22,43 @@ OBS_DIM = 28  # total observation dimensions (20 base + 8 enemy rays)
 # =============================================================================
 # Geometry Helpers
 # =============================================================================
-def line_hits_obstacle(x1, y1, x2, y2, obstacle):
-    """Check if line segment from (x1,y1) to (x2,y2) intersects obstacle.
+def point_in_obstacles(x, y, obstacles):
+    """Check if point is inside any obstacle."""
+    if obstacles is None:
+        return False
+    for obs in obstacles:
+        ox_min, oy_min, ox_max, oy_max = obs
+        if ox_min <= x <= ox_max and oy_min <= y <= oy_max:
+            return True
+    return False
+
+
+def line_hits_obstacle(x1, y1, x2, y2, obstacles):
+    """Check if line segment from (x1,y1) to (x2,y2) intersects obstacle(s).
     
     Args:
         x1, y1: Start point
         x2, y2: End point  
-        obstacle: [x_min, y_min, x_max, y_max] bounding box, or None
+        obstacle: Single [x_min, y_min, x_max, y_max] or list of obstacles, or None
     
     Returns:
-        True if line intersects obstacle, False otherwise
+        True if line intersects any obstacle, False otherwise
     """
-    if obstacle is None:
-        return False
-    
-    ox_min, oy_min, ox_max, oy_max = obstacle
-    
+
     # Check multiple points along the line
     steps = 20
     for i in range(steps + 1):
         t = i / steps
         px = x1 + t * (x2 - x1)
         py = y1 + t * (y2 - y1)
-        if ox_min <= px <= ox_max and oy_min <= py <= oy_max:
-            return True
+        for obs in obstacles:
+            ox_min, oy_min, ox_max, oy_max = obs
+            if ox_min <= px <= ox_max and oy_min <= py <= oy_max:
+                return True
     return False
 
 
-def ray_cast(x, y, angle, max_range, arena_size, obstacle):
+def ray_cast(x, y, angle, max_range, arena_size, obstacles):
     """Cast a ray and return distance to nearest hit.
     
     Args:
@@ -57,13 +66,17 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacle):
         angle: Ray direction in radians
         max_range: Maximum ray distance
         arena_size: Size of the arena (assumes square [0, arena_size])
-        obstacle: [x_min, y_min, x_max, y_max] bounding box
+        obstacle: Single [x_min, y_min, x_max, y_max] or list of obstacles
     
     Returns:
         Distance to nearest hit, capped at max_range
     """
     dx = math.cos(angle)
     dy = math.sin(angle)
+    
+    # Normalize to list of obstacles
+    if obstacles is None:
+        obstacles = []
     
     # Step along ray
     step_size = 0.2
@@ -77,9 +90,9 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacle):
         if px < 0 or px >= arena_size or py < 0 or py >= arena_size:
             return dist
         
-        # Check obstacle
-        if obstacle is not None:
-            ox_min, oy_min, ox_max, oy_max = obstacle
+        # Check obstacles
+        for obs in obstacles:
+            ox_min, oy_min, ox_max, oy_max = obs
             if ox_min <= px <= ox_max and oy_min <= py <= oy_max:
                 return dist
         
@@ -91,7 +104,7 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacle):
 # =============================================================================
 # Observation Computation
 # =============================================================================
-def compute_agent_observation(agent, enemy, obstacle, arena_size, 
+def compute_agent_observation(agent, enemy, obstacles, arena_size, 
                                was_hit_last_step=0.0, hit_enemy_last_step=0.0):
     """Compute 20-dimensional egocentric observation vector for a single agent.
     
@@ -165,7 +178,7 @@ def compute_agent_observation(agent, enemy, obstacle, arena_size,
         obs[8] = np.clip(dist_enemy / max_enemy_dist, 0.0, 1.0)  # dist_enemy_norm
         
         # Line of sight check
-        has_los = not line_hits_obstacle(x_self, y_self, enemy["pos"][0], enemy["pos"][1], obstacle)
+        has_los = not line_hits_obstacle(x_self, y_self, enemy["pos"][0], enemy["pos"][1], obstacles)
         obs[9] = 1.0 if has_los else 0.0  # has_los
     else:
         # Enemy dead defaults
@@ -183,7 +196,7 @@ def compute_agent_observation(agent, enemy, obstacle, arena_size,
         local_angle = -math.pi / 2 + t * math.pi
         global_angle = theta_self + local_angle
         
-        dist = ray_cast(x_self, y_self, global_angle, RAY_MAX_RANGE, arena_size, obstacle)
+        dist = ray_cast(x_self, y_self, global_angle, RAY_MAX_RANGE, arena_size, obstacles)
         obs[10 + i] = dist / RAY_MAX_RANGE  # ray_i_dist normalized
     
     # =========================================================================
@@ -224,8 +237,8 @@ def compute_agent_observation(agent, enemy, obstacle, arena_size,
                 
                 # Check if ray hits enemy (within radius) and no obstacle blocks
                 if perp_dist < enemy_radius:
-                    # Check if obstacle blocks the view
-                    if not line_hits_obstacle(x_self, y_self, x_enemy, y_enemy, obstacle):
+                    # Check if any obstacles blocks the view
+                    if not line_hits_obstacle(x_self, y_self, x_enemy, y_enemy, obstacles):
                         obs[20 + i] = 1.0
     # Enemy dead or not hit by any ray: indices 20-27 stay 0.0
     
@@ -240,9 +253,17 @@ class Worms3DEnv(gym.Env):
     # Grid size
     SIZE = 30
     
-    # Obstacle: None for open arena, or [x_min, y_min, x_max, y_max]
-    OBSTACLE = [10, 10, 20, 20]  # 10x10 box in center
-    
+    # Multiple obstacles for interesting arena layout
+    # Each obstacle: [x_min, y_min, x_max, y_max]
+    OBSTACLES = [
+        #[13, 13, 17, 17],  # Small center block
+        #[5, 12, 8, 18],    # Left cover
+        #[22, 12, 25, 18],  # Right cover  
+        #[12, 4, 18, 7],    # Bottom wall
+        #[12, 23, 18, 26],  # Top wall
+        [12.5, 12.5, 17.5, 17.5],  # Top wall
+    ]
+        
     # Actions: 0=nothing, 1=up, 2=down, 3=left, 4=right, 5=rotate_left, 6=rotate_right, 7=shoot
     N_ACTIONS = 8
     
@@ -325,7 +346,6 @@ class Worms3DEnv(gym.Env):
         
         MOVE_STEP = MAX_SPEED_FORWARD
         ROTATE_STEP = 0.3  # ~17 degrees per step
-        ARENA_DIAGONAL = self.SIZE * math.sqrt(2)  # ~42.426 for 30x30
         
         for i, agent in enumerate(self.agents):
             if not agent["alive"]:
@@ -402,12 +422,12 @@ class Worms3DEnv(gym.Env):
         """Get 40-dim observation (20 per agent)."""
         a0, a1 = self.agents[0], self.agents[1]
         obs0 = compute_agent_observation(
-            a0, a1, self.OBSTACLE, self.SIZE,
+            a0, a1, self.OBSTACLES, self.SIZE,
             was_hit_last_step=self.was_hit[0],
             hit_enemy_last_step=self.hit_enemy[0]
         )
         obs1 = compute_agent_observation(
-            a1, a0, self.OBSTACLE, self.SIZE,
+            a1, a0, self.OBSTACLES, self.SIZE,
             was_hit_last_step=self.was_hit[1],
             hit_enemy_last_step=self.hit_enemy[1]
         )
@@ -415,7 +435,7 @@ class Worms3DEnv(gym.Env):
     
     def _check_aiming(self, agent, enemy):
         """Check if agent is aiming at enemy. Returns 1.0 if cos_delta_enemy > 0.9 and has_los."""
-        obs = compute_agent_observation(agent, enemy, self.OBSTACLE, self.SIZE)
+        obs = compute_agent_observation(agent, enemy, self.OBSTACLES, self.SIZE)
         # cos_delta_enemy is at index 6, has_los at index 9
         return 1.0 if obs[6] > 0.9 and obs[9] > 0.5 else 0.0
     
@@ -528,15 +548,12 @@ class Worms3DEnv(gym.Env):
         })
 
     def _point_in_obstacle(self, x, y):
-        """Check if point is inside the obstacle."""
-        if self.OBSTACLE is None:
-            return False
-        ox_min, oy_min, ox_max, oy_max = self.OBSTACLE
-        return ox_min <= x <= ox_max and oy_min <= y <= oy_max
+        """Check if point is inside any obstacle."""
+        return point_in_obstacles(x, y, self.OBSTACLES)
     
     def _line_hits_obstacle(self, x1, y1, x2, y2):
         """Check if line segment from (x1,y1) to (x2,y2) intersects obstacle."""
-        return line_hits_obstacle(x1, y1, x2, y2, self.OBSTACLE)
+        return line_hits_obstacle(x1, y1, x2, y2, self.OBSTACLES)
     
     def _handle_collision(self, agent):
         """Bounds check and obstacle collision. Returns True if collision occurred."""
@@ -549,18 +566,19 @@ class Worms3DEnv(gym.Env):
         if agent["pos"][0] != old_x or agent["pos"][1] != old_y:
             collided = True
         
-        # Push out of obstacle if inside
-        if self._point_in_obstacle(agent["pos"][0], agent["pos"][1]):
-            ox_min, oy_min, ox_max, oy_max = self.OBSTACLE
-            cx, cy = (ox_min + ox_max) / 2, (oy_min + oy_max) / 2
-            # Push away from center
-            dx = agent["pos"][0] - cx
-            dy = agent["pos"][1] - cy
-            if abs(dx) > abs(dy):
-                agent["pos"][0] = ox_max + 0.1 if dx > 0 else ox_min - 0.1
-            else:
-                agent["pos"][1] = oy_max + 0.1 if dy > 0 else oy_min - 0.1
-            collided = True
+        # Push out of obstacles if inside any
+        for obs in self.OBSTACLES:
+            ox_min, oy_min, ox_max, oy_max = obs
+            if ox_min <= agent["pos"][0] <= ox_max and oy_min <= agent["pos"][1] <= oy_max:
+                cx, cy = (ox_min + ox_max) / 2, (oy_min + oy_max) / 2
+                # Push away from center
+                dx = agent["pos"][0] - cx
+                dy = agent["pos"][1] - cy
+                if abs(dx) > abs(dy):
+                    agent["pos"][0] = ox_max + 0.1 if dx > 0 else ox_min - 0.1
+                else:
+                    agent["pos"][1] = oy_max + 0.1 if dy > 0 else oy_min - 0.1
+                collided = True
         
         return collided
 
