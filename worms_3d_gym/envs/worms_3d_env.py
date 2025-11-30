@@ -11,12 +11,16 @@ import math
 # Environment Constants
 # =============================================================================
 MAX_HEALTH = 100.0
-MAX_AMMO = 10
 MAX_COOLDOWN = 5  # steps
 MAX_SPEED_FORWARD = 0.3  # units per step
 N_RAYS = 8
 RAY_MAX_RANGE = 30.0  # max ray distance (matches arena size)
-OBS_DIM = 28  # total observation dimensions (20 base + 8 enemy rays)
+OBS_DIM = 14  # total observation dimensions (simplified)
+
+MAX_PERP_DIST = 0.4 # maximum perpendicular distance to target that would still hit 
+# ROTATE_STEP = 0.25  # ~14 degrees per step
+ROTATE_STEP = 0.05
+AIM_SNAP_THRESHOLD = 0.08  # ~4.5 degrees - if within this, snap to perfect aim
 
 
 # =============================================================================
@@ -45,9 +49,10 @@ def line_hits_obstacle(x1, y1, x2, y2, obstacles):
         True if line intersects any obstacle, False otherwise
     """
 
-    # Check multiple points along the line
+    # Check multiple points along the line, but skip endpoints
+    # This prevents false positives when shooter/target is near a wall
     steps = 20
-    for i in range(steps + 1):
+    for i in range(1, steps):  # Skip i=0 (start) and i=steps (end)
         t = i / steps
         px = x1 + t * (x2 - x1)
         py = y1 + t * (y2 - y1)
@@ -106,141 +111,101 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacles):
 # =============================================================================
 def compute_agent_observation(agent, enemy, obstacles, arena_size, 
                                was_hit_last_step=0.0, hit_enemy_last_step=0.0):
-    """Compute 20-dimensional egocentric observation vector for a single agent.
+    """Compute 14-dimensional egocentric observation vector for a single agent.
+    
+    Simplified observation layout (14 dims):
+        0: cos_delta_enemy - cosine of angle to enemy (1.0 = facing enemy)
+        1: sin_delta_enemy - sine of angle to enemy (sign = turn direction)
+        2: dist_enemy_norm - normalized distance to enemy
+        3: has_los - 1.0 if line of sight to enemy
+        4: cooldown_norm - shot cooldown (0 = can shoot)
+        5: would_hit - 1.0 if shooting now would hit
+        6-13: ray distances (8 rays) - wall/obstacle detection
     
     Args:
-        agent: Dict with keys:
-            - 'pos': np.array[2] position
-            - 'health': float
-            - 'angle': float (radians)
-            - 'alive': bool
-            - 'velocity': np.array[2] (optional, defaults to [0,0])
-            - 'ammo': int (optional, defaults to MAX_AMMO)
-            - 'cooldown': int (optional, defaults to 0)
+        agent: Dict with pos, health, angle, alive, cooldown
         enemy: Dict with same structure as agent
-        obstacle: [x_min, y_min, x_max, y_max] bounding box
+        obstacles: List of [x_min, y_min, x_max, y_max] bounding boxes
         arena_size: Size of the square arena
-        was_hit_last_step: 1.0 if agent took damage last step, else 0.0
-        hit_enemy_last_step: 1.0 if agent hit enemy last step, else 0.0
+        was_hit_last_step: (unused, kept for API compatibility)
+        hit_enemy_last_step: (unused, kept for API compatibility)
     
     Returns:
-        np.array of 20 floats (see observation spec)
+        np.array of 14 floats
     """
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     
     # Get agent state
     x_self, y_self = agent["pos"][0], agent["pos"][1]
     theta_self = agent["angle"]
-    health = agent["health"]
-    velocity = agent.get("velocity", np.array([0.0, 0.0]))
-    ammo = agent.get("ammo", MAX_AMMO)
     cooldown = agent.get("cooldown", 0)
-    
-    cos_theta = math.cos(theta_self)
-    sin_theta = math.sin(theta_self)
     
     # Max enemy distance (arena diagonal)
     max_enemy_dist = arena_size * math.sqrt(2)
     
     # =========================================================================
-    # 3.1 Self state (indices 0-5)
-    # =========================================================================
-    obs[0] = cos_theta  # cos_theta_self
-    obs[1] = sin_theta  # sin_theta_self
-    
-    # Forward velocity (component along facing direction)
-    v_forward = velocity[0] * cos_theta + velocity[1] * sin_theta
-    obs[2] = np.clip(v_forward / MAX_SPEED_FORWARD, -1.0, 1.0)  # v_forward_norm
-    
-    obs[3] = np.clip(health / MAX_HEALTH, 0.0, 1.0)  # health_norm
-    obs[4] = np.clip(ammo / MAX_AMMO, 0.0, 1.0)  # ammo_norm
-    obs[5] = np.clip(cooldown / MAX_COOLDOWN, 0.0, 1.0)  # cooldown_norm
-    
-    # =========================================================================
-    # 3.2 Enemy info (indices 6-9)
+    # Enemy info (indices 0-3)
     # =========================================================================
     if enemy["alive"]:
         dx = enemy["pos"][0] - x_self
         dy = enemy["pos"][1] - y_self
         dist_enemy = math.sqrt(dx * dx + dy * dy)
         
-        if dist_enemy > 0.001:  # Avoid division by zero
-            angle_to_enemy = math.atan2(dy, dx)
-            delta_theta = angle_to_enemy - theta_self
-            
-            obs[6] = math.cos(delta_theta)  # cos_delta_enemy
-            obs[7] = math.sin(delta_theta)  # sin_delta_enemy
-        else:
-            # Same position edge case
-            obs[6] = 1.0  # cos_delta_enemy
-            obs[7] = 0.0  # sin_delta_enemy
-        
-        obs[8] = np.clip(dist_enemy / max_enemy_dist, 0.0, 1.0)  # dist_enemy_norm
-        
         # Line of sight check
         has_los = not line_hits_obstacle(x_self, y_self, enemy["pos"][0], enemy["pos"][1], obstacles)
-        obs[9] = 1.0 if has_los else 0.0  # has_los
+        obs[3] = 1.0 if has_los else 0.0  # has_los
+        
+        if has_los:
+            if dist_enemy > 0.001:
+                angle_to_enemy = math.atan2(dy, dx)
+                delta_theta = angle_to_enemy - theta_self
+                obs[0] = math.cos(delta_theta)  # cos_delta_enemy
+                obs[1] = math.sin(delta_theta)  # sin_delta_enemy
+            else:
+                obs[0] = 1.0
+                obs[1] = 0.0
+            obs[2] = np.clip(dist_enemy / max_enemy_dist, 0.0, 1.0)  # dist_enemy_norm
+        else:
+            obs[0] = 0.0
+            obs[1] = 0.0
+            obs[2] = 1.0  # Unknown distance
     else:
-        # Enemy dead defaults
-        obs[6] = 0.0  # cos_delta_enemy
-        obs[7] = 0.0  # sin_delta_enemy
-        obs[8] = 1.0  # dist_enemy_norm
-        obs[9] = 0.0  # has_los
+        obs[0] = 0.0
+        obs[1] = 0.0
+        obs[2] = 1.0
+        obs[3] = 0.0
     
     # =========================================================================
-    # 3.3 Ray sensors - wall/obstacle distance (indices 10-17)
+    # Self state (indices 4-5)
+    # =========================================================================
+    obs[4] = np.clip(cooldown / MAX_COOLDOWN, 0.0, 1.0)  # cooldown_norm
+    
+    # Would-hit indicator
+    if enemy["alive"]:
+        dx = math.cos(theta_self)
+        dy = math.sin(theta_self)
+        to_enemy_x = enemy["pos"][0] - x_self
+        to_enemy_y = enemy["pos"][1] - y_self
+        proj = to_enemy_x * dx + to_enemy_y * dy
+        
+        if proj > 0:
+            closest_x = dx * proj
+            closest_y = dy * proj
+            perp_dist = math.sqrt((to_enemy_x - closest_x)**2 + (to_enemy_y - closest_y)**2)
+            if perp_dist < MAX_PERP_DIST:
+                if not line_hits_obstacle(x_self, y_self, enemy["pos"][0], enemy["pos"][1], obstacles):
+                    obs[5] = 1.0  # Would hit!
+    
+    # =========================================================================
+    # Ray sensors - wall/obstacle distance (indices 6-13)
     # =========================================================================
     for i in range(N_RAYS):
-        # Ray angles from -π/2 to +π/2 around agent's heading
         t = i / (N_RAYS - 1) if N_RAYS > 1 else 0.5
         local_angle = -math.pi / 2 + t * math.pi
         global_angle = theta_self + local_angle
         
         dist = ray_cast(x_self, y_self, global_angle, RAY_MAX_RANGE, arena_size, obstacles)
-        obs[10 + i] = dist / RAY_MAX_RANGE  # ray_i_dist normalized
-    
-    # =========================================================================
-    # 3.4 Step feedback (indices 18-19)
-    # =========================================================================
-    obs[18] = was_hit_last_step
-    obs[19] = hit_enemy_last_step
-    
-    # =========================================================================
-    # 3.5 Ray sensors - enemy detection (indices 20-27)
-    # 1.0 if ray hits enemy, 0.0 otherwise
-    # =========================================================================
-    if enemy["alive"]:
-        x_enemy, y_enemy = enemy["pos"]
-        enemy_radius = 0.5  # Enemy hitbox radius for ray detection
-        
-        for i in range(N_RAYS):
-            t = i / (N_RAYS - 1) if N_RAYS > 1 else 0.5
-            local_angle = -math.pi / 2 + t * math.pi
-            global_angle = theta_self + local_angle
-            
-            # Ray direction
-            ray_dx = math.cos(global_angle)
-            ray_dy = math.sin(global_angle)
-            
-            # Vector from agent to enemy
-            to_enemy_x = x_enemy - x_self
-            to_enemy_y = y_enemy - y_self
-            
-            # Project enemy onto ray direction
-            proj = to_enemy_x * ray_dx + to_enemy_y * ray_dy
-            
-            if proj > 0:  # Enemy is in front along this ray
-                # Perpendicular distance from ray to enemy center
-                closest_x = ray_dx * proj
-                closest_y = ray_dy * proj
-                perp_dist = math.sqrt((to_enemy_x - closest_x)**2 + (to_enemy_y - closest_y)**2)
-                
-                # Check if ray hits enemy (within radius) and no obstacle blocks
-                if perp_dist < enemy_radius:
-                    # Check if any obstacles blocks the view
-                    if not line_hits_obstacle(x_self, y_self, x_enemy, y_enemy, obstacles):
-                        obs[20 + i] = 1.0
-    # Enemy dead or not hit by any ray: indices 20-27 stay 0.0
+        obs[6 + i] = dist / RAY_MAX_RANGE
     
     return obs
 
@@ -253,23 +218,30 @@ class Worms3DEnv(gym.Env):
     # Grid size
     SIZE = 30
     
-    # Multiple obstacles for interesting arena layout
-    # Each obstacle: [x_min, y_min, x_max, y_max]
-    OBSTACLES = [
-        #[13, 13, 17, 17],  # Small center block
-        #[5, 12, 8, 18],    # Left cover
-        #[22, 12, 25, 18],  # Right cover  
-        #[12, 4, 18, 7],    # Bottom wall
-        #[12, 23, 18, 26],  # Top wall
-        [12.5, 12.5, 17.5, 17.5],  # Top wall
+    # Obstacle configurations for curriculum
+    s = 2.5
+    OBSTACLES_PHASE2 = [
+        [s*5, s*5, s*7, s*7]  # Center obstacle
     ]
+    OBSTACLES_PHASE1 = []  # No obstacles
+    
+    # Current phase (0 = phase 1, 1 = phase 2)
+    curriculum_phase = 0
+    
+    @property
+    def OBSTACLES(self):
+        """Return obstacles based on current curriculum phase."""
+        if self.curriculum_phase >= 1:
+            return self.OBSTACLES_PHASE2
+        return self.OBSTACLES_PHASE1
         
     # Actions: 0=nothing, 1=up, 2=down, 3=left, 4=right, 5=rotate_left, 6=rotate_right, 7=shoot
     N_ACTIONS = 8
     
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, curriculum_phase=0):
         super().__init__()
         self.render_mode = render_mode
+        self.curriculum_phase = curriculum_phase
         
         # 2 agents
         self.n_agents = 2
@@ -285,37 +257,48 @@ class Worms3DEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
-        # Spawn agents on opposite sides of arena
-        # Agent 0 on left side, Agent 1 on right side
+        # Spawn agents at fixed X positions, random Y within center half
         margin = 5
         y_center = self.SIZE / 2
+        y_range = self.SIZE / 4  # ±quarter of arena from center
         
-        pos0 = np.array([margin, y_center])
-        pos1 = np.array([self.SIZE - margin, y_center])
+        #y0 = self.np_random.uniform(y_center - y_range, y_center + y_range)
+        #y1 = self.np_random.uniform(y_center - y_range, y_center + y_range)
+        y0 = y_center
+        y1 = y_center
         
-        # Calculate angle to face each other, then add random offset
-        # Agent 0 should face right (0), Agent 1 should face left (π)
-        # Add random rotation offset of ±45° to ±90° so they need to aim
-        rotation_offset_0 = self.np_random.uniform(-math.pi/2, math.pi/2)
-        rotation_offset_1 = self.np_random.uniform(-math.pi/2, math.pi/2)
+        # Fixed X positions: left and right
+        pos0 = np.array([margin, y0])
+        pos1 = np.array([self.SIZE - margin, y1])
         
-        angle0 = 0 + rotation_offset_0  # Facing right-ish
-        angle1 = math.pi + rotation_offset_1  # Facing left-ish
+        # Base angles facing away from each other, with small random offset ±30°
+        base_angle0 = 0
+        base_angle1 = math.pi
+        
+        rotation_offset_0 = self.np_random.uniform(-math.pi/6, math.pi/6)  # ±30°
+        rotation_offset_1 = self.np_random.uniform(-math.pi/6, math.pi/6)  # ±30°
+        
+        angle0 = base_angle0 + rotation_offset_0
+        angle1 = base_angle1 + rotation_offset_1
         
         self.agents = [
             {
                 "id": 0, "team": 0, 
                 "pos": pos0, 
-                "health": MAX_HEALTH, "angle": angle0, "alive": True,
+                "health": MAX_HEALTH,
+                "angle": angle0,
+                "alive": True,
                 "velocity": np.array([0.0, 0.0]),
-                "ammo": MAX_AMMO, "cooldown": 0
+                "cooldown": 0
             },
             {
                 "id": 1, "team": 1, 
                 "pos": pos1, 
-                "health": MAX_HEALTH, "angle": angle1, "alive": True,
+                "health": MAX_HEALTH,
+                "angle": angle1,
+                "alive": True,
                 "velocity": np.array([0.0, 0.0]),
-                "ammo": MAX_AMMO, "cooldown": 0
+                "cooldown": 0
             },
         ]
         
@@ -345,7 +328,6 @@ class Worms3DEnv(gym.Env):
         self.hit_enemy = [0.0, 0.0]
         
         MOVE_STEP = MAX_SPEED_FORWARD
-        ROTATE_STEP = 0.3  # ~17 degrees per step
         
         for i, agent in enumerate(self.agents):
             if not agent["alive"]:
@@ -365,46 +347,85 @@ class Worms3DEnv(gym.Env):
                 agent["pos"][0] += MOVE_STEP
             
             # Rotation actions (5-6) - absolute left/right
-            elif act == 5:  # Rotate left (counter-clockwise)
-                agent["angle"] += ROTATE_STEP
-            elif act == 6:  # Rotate right (clockwise)
-                agent["angle"] -= ROTATE_STEP
+            # If close enough to aiming at enemy, snap to perfect aim
+            elif act == 5 or act == 6:
+                if enemy["alive"]:
+                    dx_to_enemy = enemy["pos"][0] - agent["pos"][0]
+                    dy_to_enemy = enemy["pos"][1] - agent["pos"][1]
+                    angle_to_enemy = math.atan2(dy_to_enemy, dx_to_enemy)
+                    delta_angle = angle_to_enemy - agent["angle"]
+                    # Normalize to [-π, π]
+                    while delta_angle > math.pi:
+                        delta_angle -= 2 * math.pi
+                    while delta_angle < -math.pi:
+                        delta_angle += 2 * math.pi
+                    
+                    if abs(delta_angle) < AIM_SNAP_THRESHOLD:
+                        # Snap to perfect aim
+                        agent["angle"] = angle_to_enemy
+                    elif act == 5:
+                        agent["angle"] += ROTATE_STEP
+                    else:
+                        agent["angle"] -= ROTATE_STEP
+                elif act == 5:
+                    agent["angle"] += ROTATE_STEP
+                else:
+                    agent["angle"] -= ROTATE_STEP
             
             # Shoot in facing direction (7)
             elif act == 7:
                 dx = math.cos(agent["angle"])
                 dy = math.sin(agent["angle"])
-                self._shoot_direction(agent, dx, dy)  # Damage applied inside, rewards computed below
+                hit = self._shoot_direction(agent, dx, dy)
+                if not hit:
+                    rewards[i] -= 2.0  # Miss penalty to discourage spray-and-pray
             
             # Collision / Boundary Check
             self._handle_collision(agent)
             
             # =================================================================
-            # SIMPLE REWARD SYSTEM: Only hits and kills + exploration
+            # REWARD SYSTEM: Combat-focused with time pressure
             # =================================================================
             
-            # Exploration bonus: reward visiting new cells
-            cell = (int(agent["pos"][0]), int(agent["pos"][1]))
-            if cell not in self.visited[i]:
-                self.visited[i].add(cell)
-                rewards[i] += 0.1  # Small bonus for new cell
+            # Time penalty - encourage faster kills
+            rewards[i] -= 0.1
+            
+            # Aiming reward: bonus for facing enemy with LOS
+            if enemy["alive"]:
+                dx_to_enemy = enemy["pos"][0] - agent["pos"][0]
+                dy_to_enemy = enemy["pos"][1] - agent["pos"][1]
+                dist_to_enemy = math.sqrt(dx_to_enemy**2 + dy_to_enemy**2)
+                if dist_to_enemy > 0.1:
+                    angle_to_enemy = math.atan2(dy_to_enemy, dx_to_enemy)
+                    delta_angle = abs(angle_to_enemy - agent["angle"])
+                    # Normalize to [0, pi]
+                    while delta_angle > math.pi:
+                        delta_angle = abs(delta_angle - 2 * math.pi)
+                    # Reward for aiming within ~10 degrees AND having LOS
+                    if delta_angle < 0.17:  # ~10 degrees
+                        has_los = not self._line_hits_obstacle(
+                            agent["pos"][0], agent["pos"][1],
+                            enemy["pos"][0], enemy["pos"][1]
+                        )
+                        if has_los:
+                            rewards[i] += 0.3  # Aiming bonus
         
         # Damage rewards (computed after all actions processed)
         for i, agent in enumerate(self.agents):
             enemy = self.agents[1 - i]
             
-            # Reward for dealing damage: +1.0 per damage point
+            # Reward for dealing damage: +2.0 per damage point (50 per hit)
             enemy_damage = prev_health[1 - i] - enemy["health"]
             if enemy_damage > 0 and self.hit_enemy[i] > 0:
-                rewards[i] += enemy_damage  # +25 per hit
+                rewards[i] += enemy_damage * 2  # +50 per hit (25 dmg * 2)
             
-            # Kill bonus
+            # Kill bonus (moderate, since 4 hits already give +200)
             if prev_health[1 - i] > 0 and not enemy["alive"]:
-                rewards[i] += 1000
+                rewards[i] += 200
             
             # Death penalty
             if prev_health[i] > 0 and not agent["alive"]:
-                rewards[i] -= 1000
+                rewards[i] -= 400
 
         # Track steps
         self.current_step = getattr(self, 'current_step', 0) + 1
@@ -468,36 +489,6 @@ class Worms3DEnv(gym.Env):
         
         return True
     
-    def _check_clear_shot(self, agent, enemy):
-        """Check if a hitscan shot would hit the enemy right now.
-        
-        Returns True if enemy is in front, within hit radius, and no obstacle blocking.
-        """
-        dx = math.cos(agent["angle"])
-        dy = math.sin(agent["angle"])
-        
-        to_enemy = enemy["pos"] - agent["pos"]
-        
-        # Project onto shooting direction
-        proj = to_enemy[0] * dx + to_enemy[1] * dy
-        
-        if proj <= 0:  # Enemy behind us
-            return False
-        
-        # Perpendicular distance from shot line
-        closest = np.array([dx * proj, dy * proj])
-        perp_dist = np.linalg.norm(to_enemy - closest)
-        
-        if perp_dist >= 1.5:  # Outside hit radius
-            return False
-        
-        # Check if obstacle blocks
-        if self._line_hits_obstacle(agent["pos"][0], agent["pos"][1],
-                                     enemy["pos"][0], enemy["pos"][1]):
-            return False
-        
-        return True
-    
     def _shoot_direction(self, agent, dx, dy):
         """Shoot in a 2D direction (dx, dy). Applies damage, tracks hits."""
         hit = False
@@ -511,21 +502,39 @@ class Worms3DEnv(gym.Env):
                 continue
             
             # Vector to other agent (2D)
-            to_other = other["pos"] - origin
+            to_other = np.array([other["pos"][0] - origin[0], other["pos"][1] - origin[1]])
             
             # Project onto direction
             if dx != 0 or dy != 0:
+                # Ensure direction is normalized (should already be from cos/sin)
+                dir_len = math.sqrt(dx*dx + dy*dy)
+                dx_norm = dx / dir_len
+                dy_norm = dy / dir_len
+                
                 # Distance along shoot direction
-                proj = to_other[0] * dx + to_other[1] * dy
+                proj = to_other[0] * dx_norm + to_other[1] * dy_norm
+                
+                # Debug output
+                closest = np.array([dx_norm * proj, dy_norm * proj])
+                perp_dist = np.linalg.norm(to_other - closest)
+                blocked = self._line_hits_obstacle(origin[0], origin[1], other["pos"][0], other["pos"][1])
+                
+                # More detailed debug
+                if False:
+                    print(f"SHOT DEBUG:")
+                    print(f"  shooter pos: ({origin[0]:.2f}, {origin[1]:.2f})")
+                    print(f"  target pos:  ({other['pos'][0]:.2f}, {other['pos'][1]:.2f})")
+                    print(f"  direction:   ({dx:.3f}, {dy:.3f})")
+                    print(f"  to_other:    ({to_other[0]:.2f}, {to_other[1]:.2f})")
+                    print(f"  proj (dot):  {proj:.2f}")
+                    print(f"  closest pt:  ({closest[0]:.2f}, {closest[1]:.2f})")
+                    print(f"  perp_dist:   {perp_dist:.2f}")
+                    print(f"  blocked:     {blocked}")
                 
                 if proj > 0:  # In front of us
-                    # Perpendicular distance
-                    closest = np.array([dx * proj, dy * proj])
-                    perp_dist = np.linalg.norm(to_other - closest)
-                    
-                    if perp_dist < 1.5:  # Hit radius
+                    if perp_dist < MAX_PERP_DIST:  # Hit radius (tighter for precision)
                         # Check if obstacle blocks the shot
-                        if self._line_hits_obstacle(origin[0], origin[1], other["pos"][0], other["pos"][1]):
+                        if blocked:
                             continue  # Shot blocked by obstacle
                         
                         damage = 25
@@ -546,6 +555,8 @@ class Worms3DEnv(gym.Env):
             "hit": hit,
             "team": agent["team"]
         })
+        
+        return hit
 
     def _point_in_obstacle(self, x, y):
         """Check if point is inside any obstacle."""
