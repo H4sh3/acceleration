@@ -33,22 +33,38 @@ ACCELERATION = 0.08  # How fast agent accelerates
 MAX_VELOCITY = 0.5  # Maximum speed
 FRICTION = 0.92  # Velocity decay per tick (1.0 = no friction)
 
+# Projectile constants
+PROJECTILE_SPEED = 0.8
+PROJECTILE_DAMAGE = 25
+PROJECTILE_RADIUS = 0.5  # Hit detection radius
+MAX_PROJECTILES = 5
 
-# Extended observation dimension for zombie env (base 28 + 3 powerup info)
-ZOMBIE_OBS_DIM = 31
+
+# Extended observation dimension for zombie env
+# Base 28 + 3 powerup + 1 aim + 4 second zombie + 1 shots left + 1 zombie count = 38
+ZOMBIE_OBS_DIM = 38
 
 
 def compute_agent_observation_zombie(agent_pos, agent_angle, agent_health, agent_velocity,
                                       closest_zombie_pos, closest_zombie_alive, 
+                                      second_zombie_pos, second_zombie_alive,
                                       closest_powerup_pos, closest_powerup_active,
                                       obstacles, arena_size,
+                                      num_active_projectiles, num_zombies,
                                       was_hit_last_step=0.0, hit_enemy_last_step=0.0):
-    """Compute observation - same format as 2-agent env but enemy = closest zombie.
+    """Compute observation for zombie survival env.
     
-    Added powerup info at indices 28-30:
-        28: cos(delta_angle_to_powerup)
-        29: sin(delta_angle_to_powerup) 
-        30: normalized distance to powerup
+    Indices:
+        0-3: Self state (cos_theta, sin_theta, v_forward, health)
+        6-9: Closest zombie (cos_delta, sin_delta, dist, LOS)
+        10-17: Wall ray sensors
+        18-19: Step feedback (was_hit, hit_enemy)
+        20-27: Enemy ray sensors
+        28-30: Closest powerup (cos_delta, sin_delta, dist)
+        31: Aim indicator (1.0 if on target)
+        32-35: 2nd closest zombie (cos_delta, sin_delta, dist, LOS)
+        36: Shots remaining (normalized 0-1)
+        37: Zombie count (normalized 0-1)
     """
     obs = np.zeros(ZOMBIE_OBS_DIM, dtype=np.float32)
     
@@ -158,6 +174,64 @@ def compute_agent_observation_zombie(agent_pos, agent_angle, agent_health, agent
         obs[29] = 0.0
         obs[30] = 1.0  # Max distance = no powerup
     
+    # Aim indicator (index 31) - 1.0 if aiming at closest zombie and would hit
+    obs[31] = 0.0
+    if closest_zombie_alive and closest_zombie_pos is not None:
+        # Check if agent's facing direction would hit the zombie
+        to_zombie_x = closest_zombie_pos[0] - x_self
+        to_zombie_y = closest_zombie_pos[1] - y_self
+        
+        # Project zombie position onto agent's facing direction
+        proj = to_zombie_x * cos_theta + to_zombie_y * sin_theta
+        
+        if proj > 0:  # Zombie is in front
+            # Perpendicular distance from aim line to zombie
+            closest_on_ray_x = cos_theta * proj
+            closest_on_ray_y = sin_theta * proj
+            perp_dist = math.sqrt((to_zombie_x - closest_on_ray_x)**2 + (to_zombie_y - closest_on_ray_y)**2)
+            
+            hit_radius = 1.0  # How close the aim needs to be (projectile radius + zombie radius)
+            if perp_dist < hit_radius:
+                # Check line of sight
+                if not line_hits_obstacle(x_self, y_self, closest_zombie_pos[0], closest_zombie_pos[1], obstacles):
+                    obs[31] = 1.0
+    
+    # 2nd closest zombie info (indices 32-35)
+    if second_zombie_alive and second_zombie_pos is not None:
+        dx = second_zombie_pos[0] - x_self
+        dy = second_zombie_pos[1] - y_self
+        dist_enemy = math.sqrt(dx * dx + dy * dy)
+        
+        has_los = not line_hits_obstacle(x_self, y_self, second_zombie_pos[0], second_zombie_pos[1], obstacles)
+        obs[35] = 1.0 if has_los else 0.0
+        
+        if has_los:
+            if dist_enemy > 0.001:
+                angle_to_enemy = math.atan2(dy, dx)
+                delta_theta = angle_to_enemy - theta_self
+                obs[32] = math.cos(delta_theta)
+                obs[33] = math.sin(delta_theta)
+            else:
+                obs[32] = 1.0
+                obs[33] = 0.0
+            obs[34] = np.clip(dist_enemy / max_enemy_dist, 0.0, 1.0)
+        else:
+            obs[32] = 0.0
+            obs[33] = 0.0
+            obs[34] = 1.0
+    else:
+        obs[32] = 0.0
+        obs[33] = 0.0
+        obs[34] = 1.0
+        obs[35] = 0.0
+    
+    # Shots remaining (index 36) - normalized 0-1
+    shots_remaining = MAX_PROJECTILES - num_active_projectiles
+    obs[36] = shots_remaining / MAX_PROJECTILES
+    
+    # Zombie count (index 37) - normalized, assume max 10 zombies
+    obs[37] = np.clip(num_zombies / 10.0, 0.0, 1.0)
+    
     return obs
 
 
@@ -172,8 +246,8 @@ class ZombieSurvivalEnv(gym.Env):
         [12.5, 12.5, 17.5, 17.5],
     ]
     
-    # Same action space as combat env
-    N_ACTIONS = 9
+    # Action space: 0=noop, 1-4=move, 5-6=fine rotate, 7-8=coarse rotate, 9=shoot, 10=dash
+    N_ACTIONS = 11
     
     def __init__(self, render_mode=None):
         super().__init__()
@@ -237,6 +311,7 @@ class ZombieSurvivalEnv(gym.Env):
         self.hit_enemy = 0.0
         
         self.last_shots = []
+        self.projectiles = []  # Active projectiles
         
         # Spawn initial 2 zombies and 1 powerup
         for _ in range(2):
@@ -277,20 +352,21 @@ class ZombieSurvivalEnv(gym.Env):
         }
         self.zombies.append(zombie)
 
+    def _get_closest_zombies(self, n=2):
+        """Get the n closest alive zombies to the player."""
+        alive_zombies = [(z, np.linalg.norm(z["pos"] - self.agent["pos"])) 
+                         for z in self.zombies if z["alive"]]
+        alive_zombies.sort(key=lambda x: x[1])
+        
+        result = [None] * n
+        for i, (z, _) in enumerate(alive_zombies[:n]):
+            result[i] = z
+        return result
+    
     def _get_closest_zombie(self):
         """Get the closest alive zombie to the player."""
-        closest = None
-        closest_dist = float('inf')
-        
-        for z in self.zombies:
-            if not z["alive"]:
-                continue
-            dist = np.linalg.norm(z["pos"] - self.agent["pos"])
-            if dist < closest_dist:
-                closest_dist = dist
-                closest = z
-        
-        return closest
+        zombies = self._get_closest_zombies(1)
+        return zombies[0]
     
     def _spawn_powerup(self):
         """Spawn a speed powerup at a random location."""
@@ -336,12 +412,14 @@ class ZombieSurvivalEnv(gym.Env):
         speed_mult = SPEED_BOOST_MULTIPLIER if agent["speed_boost"] > 0 else 1.0
         max_vel = MAX_VELOCITY * speed_mult
         accel = ACCELERATION * speed_mult
-        ROTATE_STEP = 0.3
+        ROTATE_FINE = 0.05  # Small rotation
+        ROTATE_COARSE = 0.3  # Large rotation
         
         # Track if agent accelerated
         moved = False
         
-        # Process player action - now controls acceleration, not position
+        # Process player action
+        # 0=noop, 1-4=move, 5-6=fine rotate, 7-8=coarse rotate, 9=shoot, 10=dash
         if action == 1:  # Accelerate Up (Y+)
             agent["velocity"][1] += accel
             moved = True
@@ -354,15 +432,24 @@ class ZombieSurvivalEnv(gym.Env):
         elif action == 4:  # Accelerate Right (X+)
             agent["velocity"][0] += accel
             moved = True
-        elif action == 5:  # Rotate left
-            agent["angle"] += ROTATE_STEP
-        elif action == 6:  # Rotate right
-            agent["angle"] -= ROTATE_STEP
-        elif action == 7:  # Shoot
-            dx = math.cos(agent["angle"])
-            dy = math.sin(agent["angle"])
-            reward += self._shoot_zombies(dx, dy)
-        elif action == 8:  # Dash - instant velocity boost in facing direction
+        elif action == 5:  # Fine rotate left
+            agent["angle"] += ROTATE_FINE
+        elif action == 6:  # Fine rotate right
+            agent["angle"] -= ROTATE_FINE
+        elif action == 7:  # Coarse rotate left
+            agent["angle"] += ROTATE_COARSE
+        elif action == 8:  # Coarse rotate right
+            agent["angle"] -= ROTATE_COARSE
+        elif action == 9:  # Shoot projectile
+            if len(self.projectiles) < MAX_PROJECTILES:
+                dx = math.cos(agent["angle"])
+                dy = math.sin(agent["angle"])
+                self.projectiles.append({
+                    "pos": agent["pos"].copy(),
+                    "vel": np.array([dx * PROJECTILE_SPEED, dy * PROJECTILE_SPEED]),
+                    "active": True
+                })
+        elif action == 10:  # Dash
             if agent["dash_cooldown"] <= 0:
                 dx = math.cos(agent["angle"])
                 dy = math.sin(agent["angle"])
@@ -401,6 +488,9 @@ class ZombieSurvivalEnv(gym.Env):
         
         # Check powerup collection
         reward += self._check_powerup_collection()
+        
+        # Update projectiles
+        reward += self._update_projectiles()
         
         # Move zombies toward player
         for zombie in self.zombies:
@@ -451,46 +541,57 @@ class ZombieSurvivalEnv(gym.Env):
         
         return self._get_obs(), reward, terminated, truncated, {"kills": self.kills}
     
-    def _shoot_zombies(self, dx, dy):
-        """Shoot in direction, damage zombies. Returns reward."""
+    def _update_projectiles(self):
+        """Update all projectiles - move them and check for hits. Returns reward."""
         reward = 0.0
-        origin = self.agent["pos"].copy()
-        hit = False
+        self.last_shots = []  # Clear for renderer
         
-        for zombie in self.zombies:
-            if not zombie["alive"]:
+        for proj in self.projectiles:
+            if not proj["active"]:
                 continue
             
-            to_zombie = zombie["pos"] - origin
+            # Move projectile
+            proj["pos"] += proj["vel"]
             
-            if dx != 0 or dy != 0:
-                proj = to_zombie[0] * dx + to_zombie[1] * dy
+            # Check bounds - deactivate if out of arena
+            if (proj["pos"][0] < 0 or proj["pos"][0] > self.SIZE or
+                proj["pos"][1] < 0 or proj["pos"][1] > self.SIZE):
+                proj["active"] = False
+                continue
+            
+            # Check obstacle collision
+            if point_in_obstacles(proj["pos"][0], proj["pos"][1], self.OBSTACLES):
+                proj["active"] = False
+                continue
+            
+            # Check zombie hits
+            for zombie in self.zombies:
+                if not zombie["alive"]:
+                    continue
                 
-                if proj > 0:
-                    closest = np.array([dx * proj, dy * proj])
-                    perp_dist = np.linalg.norm(to_zombie - closest)
+                dist = np.linalg.norm(proj["pos"] - zombie["pos"])
+                if dist < PROJECTILE_RADIUS + 0.5:  # 0.5 = zombie radius
+                    zombie["health"] -= PROJECTILE_DAMAGE
+                    self.hit_enemy = 1.0
+                    reward += PROJECTILE_DAMAGE
+                    proj["active"] = False
                     
-                    if perp_dist < 1.5:
-                        if line_hits_obstacle(origin[0], origin[1], zombie["pos"][0], zombie["pos"][1], self.OBSTACLES):
-                            continue
-                        
-                        damage = 25
-                        zombie["health"] -= damage
-                        hit = True
-                        self.hit_enemy = 1.0
-                        reward += damage  # Reward for damage
-                        
-                        if zombie["health"] <= 0:
-                            zombie["alive"] = False
-                            self.kills += 1
-                            reward += 100  # Kill bonus
+                    if zombie["health"] <= 0:
+                        zombie["alive"] = False
+                        self.kills += 1
+                        reward += 100  # Kill bonus
+                    break
+            
+            # Record for renderer
+            if proj["active"]:
+                self.last_shots.append({
+                    "pos": proj["pos"].copy(),
+                    "vel": proj["vel"].copy(),
+                    "active": True
+                })
         
-        self.last_shots.append({
-            "origin": origin,
-            "dx": dx, "dy": dy,
-            "hit": hit,
-            "team": 0
-        })
+        # Remove inactive projectiles
+        self.projectiles = [p for p in self.projectiles if p["active"]]
         
         return reward
     
@@ -534,18 +635,25 @@ class ZombieSurvivalEnv(gym.Env):
         return closest
     
     def _get_obs(self):
-        """Get observation (62 dims = 31 per slot, duplicated)."""
-        closest_zombie = self._get_closest_zombie()
+        """Get observation (76 dims = 38 per slot, duplicated)."""
+        closest_zombies = self._get_closest_zombies(2)
+        closest_zombie = closest_zombies[0]
+        second_zombie = closest_zombies[1]
         closest_powerup = self._get_closest_powerup()
+        
+        num_alive_zombies = sum(1 for z in self.zombies if z["alive"])
         
         obs = compute_agent_observation_zombie(
             self.agent["pos"], self.agent["angle"], 
             self.agent["health"], self.agent.get("velocity", np.array([0.0, 0.0])),
             closest_zombie["pos"] if closest_zombie else None,
             closest_zombie is not None and closest_zombie["alive"] if closest_zombie else False,
+            second_zombie["pos"] if second_zombie else None,
+            second_zombie is not None and second_zombie["alive"] if second_zombie else False,
             closest_powerup["pos"] if closest_powerup else None,
             closest_powerup is not None and closest_powerup["active"] if closest_powerup else False,
             self.OBSTACLES, self.SIZE,
+            len(self.projectiles), num_alive_zombies,
             was_hit_last_step=self.was_hit,
             hit_enemy_last_step=self.hit_enemy
         )

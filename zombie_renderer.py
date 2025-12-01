@@ -136,11 +136,19 @@ class ZombieRenderer:
         shot_snapshot = []
         if shots:
             for s in shots:
-                shot_snapshot.append({
-                    "origin": s["origin"].copy(),
-                    "dx": s["dx"], "dy": s["dy"],
-                    "hit": s["hit"]
-                })
+                # Handle new projectile format (pos, vel) or legacy format (origin, dx, dy)
+                if "pos" in s:
+                    shot_snapshot.append({
+                        "pos": s["pos"].copy(),
+                        "vel": s["vel"].copy(),
+                        "active": s.get("active", True)
+                    })
+                else:
+                    shot_snapshot.append({
+                        "origin": s["origin"].copy(),
+                        "dx": s["dx"], "dy": s["dy"],
+                        "hit": s.get("hit", False)
+                    })
         
         powerup_snapshot = []
         if powerups:
@@ -246,21 +254,21 @@ class ZombieRenderer:
         pygame.draw.rect(self.screen, self.ZOMBIE_COLOR, (bar_x, bar_y, int(bar_width * health_pct), bar_height))
     
     def _draw_shots(self, shots):
-        """Draw shot tracers."""
+        """Draw projectiles as circles."""
         for shot in shots:
-            ox, oy = self.world_to_screen(shot["origin"][0], shot["origin"][1])
-            dx, dy = shot["dx"], -shot["dy"]  # Flip dy for screen coords
-            end_x = ox + dx * self.game_width
-            end_y = oy + dy * self.game_height
-            
-            if shot["hit"]:
-                color = self.SHOT_COLOR_HIT
-                width = 3
-            else:
-                color = self.PLAYER_COLOR
-                width = 2
-            
-            pygame.draw.line(self.screen, color, (ox, oy), (int(end_x), int(end_y)), width)
+            # New projectile format: pos, vel, active
+            if "pos" in shot:
+                sx, sy = self.world_to_screen(shot["pos"][0], shot["pos"][1])
+                pygame.draw.circle(self.screen, self.SHOT_COLOR_HIT, (sx, sy), 5)
+                pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), 5, 1)
+            # Legacy format: origin, dx, dy
+            elif "origin" in shot:
+                ox, oy = self.world_to_screen(shot["origin"][0], shot["origin"][1])
+                dx, dy = shot["dx"], -shot["dy"]
+                end_x = ox + dx * self.game_width
+                end_y = oy + dy * self.game_height
+                color = self.SHOT_COLOR_HIT if shot.get("hit") else self.PLAYER_COLOR
+                pygame.draw.line(self.screen, color, (ox, oy), (int(end_x), int(end_y)), 2)
     
     def _draw_powerups(self, powerups):
         """Draw powerups."""
@@ -351,8 +359,8 @@ class ZombieRenderer:
         
         # Get latest frame from stacked observation
         obs = self.current_obs.flatten()
-        agent_obs_dim = 31  # 28 base + 3 powerup
-        total_obs_dim = agent_obs_dim * 2  # 62 for zombie env (duplicated)
+        agent_obs_dim = 38  # 28 base + 3 powerup + 1 aim + 4 second zombie + 2 counts
+        total_obs_dim = agent_obs_dim * 2  # 76 for zombie env (duplicated)
         
         if len(obs) >= total_obs_dim * 4:
             # Get last frame from stacked obs
@@ -361,7 +369,7 @@ class ZombieRenderer:
         elif len(obs) >= total_obs_dim:
             obs = obs[:total_obs_dim]
         
-        # Use first 31 dims (player observation)
+        # Use first 38 dims (player observation)
         agent_obs = obs[:agent_obs_dim] if len(obs) >= agent_obs_dim else obs
         
         y_start = 10
@@ -405,6 +413,28 @@ class ZombieRenderer:
                 ("cos Δ", agent_obs[28]),
                 ("sin Δ", agent_obs[29]),
                 ("dist", agent_obs[30]),
+            ])
+        
+        # Aim indicator (31)
+        if len(agent_obs) >= 32:
+            y = self._draw_obs_section(panel_x, y, "Aim", [
+                ("on_target", agent_obs[31]),
+            ])
+        
+        # 2nd closest zombie (32-35)
+        if len(agent_obs) >= 36:
+            y = self._draw_obs_section(panel_x, y, "2nd Zombie", [
+                ("cos Δ", agent_obs[32]),
+                ("sin Δ", agent_obs[33]),
+                ("dist", agent_obs[34]),
+                ("LOS", agent_obs[35]),
+            ])
+        
+        # Shots and zombie count (36-37)
+        if len(agent_obs) >= 38:
+            y = self._draw_obs_section(panel_x, y, "Status", [
+                ("shots_left", agent_obs[36]),
+                ("zombie_cnt", agent_obs[37]),
             ])
     
     def _draw_obs_section(self, panel_x, y, title, items):
@@ -569,8 +599,8 @@ def run_zombie_renderer():
         action = action.flatten()
         
         # Log action
-        action_names = ["nothing", "up", "down", "left", "right", "rot_left", "rot_right", "shoot", "dash"]
-        action_name = action_names[int(action[0])]
+        action_names = ["nothing", "up", "down", "left", "right", "fine_rot_L", "fine_rot_R", "coarse_rot_L", "coarse_rot_R", "shoot", "dash"]
+        action_name = action_names[int(action[0])] if int(action[0]) < len(action_names) else f"action_{action[0]}"
         
         old_hp = unwrapped.agent["health"]
         old_kills = unwrapped.kills
