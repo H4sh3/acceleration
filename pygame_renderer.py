@@ -501,7 +501,7 @@ def run_with_pygame_renderer():
         actions = actions.flatten()
         
         # Log actions
-        action_names = ["nothing", "up", "down", "left", "right", "rot_left", "rot_right", "shoot"]
+        action_names = ["nothing", "up", "down", "left", "right", "rot_left", "rot_right", "shoot", "dash"]
         a0_name = action_names[int(actions[0])]
         a1_name = action_names[int(actions[1])]
         
