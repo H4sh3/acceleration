@@ -107,12 +107,21 @@ class PygameRenderer:
         shot_snapshot = []
         if shots:
             for s in shots:
-                shot_snapshot.append({
-                    "origin": s["origin"].copy(),
-                    "dx": s["dx"], "dy": s["dy"],
-                    "hit": s["hit"],
-                    "team": s["team"]
-                })
+                # Handle new projectile format (pos, vel) or legacy format (origin, dx, dy)
+                if "pos" in s:
+                    shot_snapshot.append({
+                        "pos": s["pos"].copy(),
+                        "vel": s["vel"].copy(),
+                        "owner": s.get("owner", 0),
+                        "active": s.get("active", True)
+                    })
+                else:
+                    shot_snapshot.append({
+                        "origin": s["origin"].copy(),
+                        "dx": s["dx"], "dy": s["dy"],
+                        "hit": s.get("hit", False),
+                        "team": s.get("team", 0)
+                    })
         
         self.history.append({
             "agents": agent_snapshot, 
@@ -150,24 +159,33 @@ class PygameRenderer:
             pygame.draw.rect(self.screen, (101, 67, 33), obstacle_rect)  # Dark brown fill
             pygame.draw.rect(self.screen, BLACK, obstacle_rect, 3)  # Black border
         
-        # Draw shots (laser beams)
+        # Draw shots/projectiles
         if shots:
             for shot in shots:
-                ox, oy = self.world_to_screen(shot["origin"][0], shot["origin"][1])
-                # Extend line to edge of screen
-                dx, dy = shot["dx"], -shot["dy"]  # Flip dy for screen coords
-                end_x = ox + dx * self.screen_width
-                end_y = oy + dy * self.screen_height
-                
-                # Color based on team and hit
-                if shot["hit"]:
-                    color = (255, 255, 0)  # Yellow for hit
-                    width = 3
+                # Handle new projectile format (pos, vel)
+                if "pos" in shot:
+                    px, py = self.world_to_screen(shot["pos"][0], shot["pos"][1])
+                    owner = shot.get("owner", 0)
+                    color = TEAM_COLORS[owner % len(TEAM_COLORS)]
+                    pygame.draw.circle(self.screen, color, (px, py), 6)
+                    pygame.draw.circle(self.screen, (255, 255, 255), (px, py), 6, 2)
                 else:
-                    color = TEAM_COLORS[shot["team"]]
-                    width = 2
-                
-                pygame.draw.line(self.screen, color, (ox, oy), (int(end_x), int(end_y)), width)
+                    # Legacy hitscan format (origin, dx, dy)
+                    ox, oy = self.world_to_screen(shot["origin"][0], shot["origin"][1])
+                    # Extend line to edge of screen
+                    dx, dy = shot["dx"], -shot["dy"]  # Flip dy for screen coords
+                    end_x = ox + dx * self.screen_width
+                    end_y = oy + dy * self.screen_height
+                    
+                    # Color based on team and hit
+                    if shot.get("hit", False):
+                        color = (255, 255, 0)  # Yellow for hit
+                        width = 3
+                    else:
+                        color = TEAM_COLORS[shot.get("team", 0)]
+                        width = 2
+                    
+                    pygame.draw.line(self.screen, color, (ox, oy), (int(end_x), int(end_y)), width)
         
         # Draw agents
         for agent in agents:
@@ -235,10 +253,10 @@ class PygameRenderer:
                         (panel_x, 0), (panel_x, self.screen_height), 2)
         
         # Get latest frame from stacked observation
-        # Frame stacking: 4 frames x 56 dims = 224 total (28 per agent x 2 agents)
+        # Frame stacking: 4 frames x 58 dims = 232 total (29 per agent x 2 agents)
         obs = self.current_obs.flatten()
-        agent_obs_dim = 28  # Updated observation dimension per agent
-        total_obs_dim = agent_obs_dim * 2  # 56 for both agents
+        agent_obs_dim = 29  # Updated observation dimension per agent (28 base + 1 aim)
+        total_obs_dim = agent_obs_dim * 2  # 58 for both agents
         
         if len(obs) >= total_obs_dim * 4:
             # Get last frame (most recent) from stacked obs
@@ -247,7 +265,7 @@ class PygameRenderer:
         elif len(obs) >= total_obs_dim:
             obs = obs[:total_obs_dim]
         
-        # Split into agent 0 and agent 1 observations (28 dims each)
+        # Split into agent 0 and agent 1 observations (29 dims each)
         obs0 = obs[:agent_obs_dim] if len(obs) >= agent_obs_dim else obs
         obs1 = obs[agent_obs_dim:agent_obs_dim*2] if len(obs) >= agent_obs_dim*2 else None
         
@@ -299,6 +317,12 @@ class PygameRenderer:
                 ("was_hit", agent_obs[18]),
                 ("hit_enemy", agent_obs[19]),
             ])
+            
+            # Aim indicator (28)
+            if len(agent_obs) >= 29:
+                y = self._draw_obs_section(col_x, y, "Aim", [
+                    ("on_target", agent_obs[28]),
+                ])
     
     def _draw_obs_section(self, panel_x, y, title, items):
         """Draw a section of observation values."""
@@ -556,7 +580,7 @@ def run_with_pygame_renderer():
     env.close()
     
     print(f"Recorded {len(renderer.history)} frames. Playing back...")
-    renderer.play_history(fps=5)
+    renderer.play_history(fps=15)
 
 
 if __name__ == "__main__":

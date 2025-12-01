@@ -18,7 +18,14 @@ DASH_DISTANCE = 5.0  # units
 MAX_SPEED_FORWARD = 0.3  # units per step
 N_RAYS = 8
 RAY_MAX_RANGE = 30.0  # max ray distance (matches arena size)
-OBS_DIM = 28  # total observation dimensions (20 base + 8 enemy rays)
+
+# Projectile constants
+PROJECTILE_SPEED = 0.8
+PROJECTILE_DAMAGE = 25
+PROJECTILE_RADIUS = 0.5  # Hit detection radius
+MAX_PROJECTILES = 5  # Max active projectiles per agent
+
+OBS_DIM = 29  # total observation dimensions (28 base + 1 aim indicator)
 
 
 # =============================================================================
@@ -109,7 +116,15 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacles):
 def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_velocity,
                                enemy_pos, enemy_alive, obstacles, arena_size, 
                                was_hit_last_step=0.0, hit_enemy_last_step=0.0):
-    """Compute 20-dimensional egocentric observation vector for a single agent.
+    """Compute 29-dimensional egocentric observation vector for a single agent.
+    
+    Indices:
+        0-3: Self state (cos_theta, sin_theta, v_forward, health)
+        6-9: Enemy info (cos_delta, sin_delta, dist, LOS)
+        10-17: Wall ray sensors
+        18-19: Step feedback (was_hit, hit_enemy)
+        20-27: Enemy ray sensors
+        28: Aim indicator (1.0 if on target and would hit)
     
     Args:
         agent_pos: np.array[2] agent position
@@ -124,7 +139,7 @@ def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_veloci
         hit_enemy_last_step: 1.0 if agent hit enemy last step, else 0.0
     
     Returns:
-        np.array of 20 floats (see observation spec)
+        np.array of 29 floats
     """
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     
@@ -245,6 +260,30 @@ def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_veloci
                         obs[20 + i] = 1.0
     # Enemy dead or not hit by any ray: indices 20-27 stay 0.0
     
+    # =========================================================================
+    # 3.6 Aim indicator (index 28) - 1.0 if aiming at enemy and would hit
+    # =========================================================================
+    obs[28] = 0.0
+    if enemy_alive:
+        # Check if agent's facing direction would hit the enemy
+        to_enemy_x = enemy_pos[0] - x_self
+        to_enemy_y = enemy_pos[1] - y_self
+        
+        # Project enemy position onto agent's facing direction
+        proj = to_enemy_x * cos_theta + to_enemy_y * sin_theta
+        
+        if proj > 0:  # Enemy is in front
+            # Perpendicular distance from aim line to enemy
+            closest_on_ray_x = cos_theta * proj
+            closest_on_ray_y = sin_theta * proj
+            perp_dist = math.sqrt((to_enemy_x - closest_on_ray_x)**2 + (to_enemy_y - closest_on_ray_y)**2)
+            
+            hit_radius = 1.0  # Projectile radius + enemy radius
+            if perp_dist < hit_radius:
+                # Check line of sight
+                if not line_hits_obstacle(x_self, y_self, enemy_pos[0], enemy_pos[1], obstacles):
+                    obs[28] = 1.0
+    
     return obs
 
 
@@ -324,8 +363,9 @@ class Worms3DEnv(gym.Env):
             },
         ]
         
-        # Track shots for rendering
+        # Track shots/projectiles for rendering
         self.last_shots = []
+        self.projectiles = [[], []]  # Per-agent projectile lists
         
         # Step feedback tracking
         self.was_hit = [0.0, 0.0]  # per agent
@@ -375,11 +415,17 @@ class Worms3DEnv(gym.Env):
             elif act == 6:  # Rotate right (clockwise)
                 agent["angle"] -= ROTATE_STEP
             
-            # Shoot in facing direction (7)
+            # Shoot projectile (7)
             elif act == 7:
-                dx = math.cos(agent["angle"])
-                dy = math.sin(agent["angle"])
-                self._shoot_direction(agent, dx, dy)  # Damage applied inside, rewards computed below
+                if len(self.projectiles[i]) < MAX_PROJECTILES:
+                    dx = math.cos(agent["angle"])
+                    dy = math.sin(agent["angle"])
+                    self.projectiles[i].append({
+                        "pos": agent["pos"].copy(),
+                        "vel": np.array([dx * PROJECTILE_SPEED, dy * PROJECTILE_SPEED]),
+                        "owner": i,
+                        "active": True
+                    })
             
             # Dash forward (8)
             elif act == 8:
@@ -407,6 +453,9 @@ class Worms3DEnv(gym.Env):
                 self.visited[i].add(cell)
                 rewards[i] += 0.1  # Small bonus for new cell
         
+        # Update projectiles and apply damage
+        self._update_projectiles()
+        
         # Damage rewards (computed after all actions processed)
         for i, agent in enumerate(self.agents):
             enemy = self.agents[1 - i]
@@ -416,13 +465,10 @@ class Worms3DEnv(gym.Env):
             if enemy_damage > 0 and self.hit_enemy[i] > 0:
                 rewards[i] += enemy_damage  # +25 per hit
             
-            # Kill bonus
+            # Kill bonus (no death penalty - we want aggressive play)
+            # Since rewards are summed, death penalty would cancel out kill bonus
             if prev_health[1 - i] > 0 and not enemy["alive"]:
-                rewards[i] += 1000
-            
-            # Death penalty
-            if prev_health[i] > 0 and not agent["alive"]:
-                rewards[i] -= 1000
+                rewards[i] += 500  # Reward for killing
 
         # Track steps
         self.current_step = getattr(self, 'current_step', 0) + 1
@@ -437,7 +483,7 @@ class Worms3DEnv(gym.Env):
         return self._get_obs(), total_reward, terminated, truncated, {"alive_teams": list(alive_teams)}
 
     def _get_obs(self):
-        """Get 40-dim observation (20 per agent)."""
+        """Get 58-dim observation (29 per agent)."""
         a0, a1 = self.agents[0], self.agents[1]
         obs0 = compute_agent_observation(
             a0["pos"], a0["angle"], a0["health"], a0.get("velocity", np.array([0.0, 0.0])),
@@ -452,6 +498,59 @@ class Worms3DEnv(gym.Env):
             hit_enemy_last_step=self.hit_enemy[1]
         )
         return np.concatenate([obs0, obs1])
+    
+    def _update_projectiles(self):
+        """Update all projectiles - move, check collisions, apply damage."""
+        # Collect all projectiles for rendering
+        self.last_shots = []
+        
+        for owner_id in range(2):
+            for proj in self.projectiles[owner_id]:
+                if not proj["active"]:
+                    continue
+                
+                # Move projectile
+                proj["pos"] += proj["vel"]
+                
+                # Add to last_shots for rendering
+                self.last_shots.append({
+                    "pos": proj["pos"].copy(),
+                    "vel": proj["vel"].copy(),
+                    "owner": owner_id,
+                    "active": True
+                })
+                
+                # Check bounds
+                if (proj["pos"][0] < 0 or proj["pos"][0] > self.SIZE or
+                    proj["pos"][1] < 0 or proj["pos"][1] > self.SIZE):
+                    proj["active"] = False
+                    continue
+                
+                # Check obstacle collision
+                if point_in_obstacles(proj["pos"][0], proj["pos"][1], self.OBSTACLES):
+                    proj["active"] = False
+                    continue
+                
+                # Check hit on enemy (the other agent)
+                enemy_id = 1 - owner_id
+                enemy = self.agents[enemy_id]
+                
+                if enemy["alive"]:
+                    dist = np.linalg.norm(proj["pos"] - enemy["pos"])
+                    if dist < PROJECTILE_RADIUS + 0.5:  # projectile radius + agent radius
+                        # Hit!
+                        enemy["health"] -= PROJECTILE_DAMAGE
+                        proj["active"] = False
+                        
+                        # Track feedback
+                        self.was_hit[enemy_id] = 1.0
+                        self.hit_enemy[owner_id] = 1.0
+                        
+                        if enemy["health"] <= 0:
+                            enemy["alive"] = False
+            
+            # Remove inactive projectiles
+            self.projectiles[owner_id] = [p for p in self.projectiles[owner_id] if p["active"]]
     
     def _check_aiming(self, agent, enemy):
         """Check if agent is aiming at enemy. Returns 1.0 if cos_delta_enemy > 0.9 and has_los."""
