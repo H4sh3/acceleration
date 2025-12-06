@@ -25,7 +25,7 @@ PROJECTILE_DAMAGE = 25
 PROJECTILE_RADIUS = 0.5  # Hit detection radius
 MAX_PROJECTILES = 5  # Max active projectiles per agent
 
-OBS_DIM = 29  # total observation dimensions (28 base + 1 aim indicator)
+OBS_DIM = 37  # total observation dimensions (29 base + 8 projectile rays)
 
 
 # =============================================================================
@@ -115,8 +115,9 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacles):
 # =============================================================================
 def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_velocity,
                                enemy_pos, enemy_alive, obstacles, arena_size, 
-                               was_hit_last_step=0.0, hit_enemy_last_step=0.0):
-    """Compute 29-dimensional egocentric observation vector for a single agent.
+                               was_hit_last_step=0.0, hit_enemy_last_step=0.0,
+                               enemy_projectiles=None):
+    """Compute 37-dimensional egocentric observation vector for a single agent.
     
     Indices:
         0-3: Self state (cos_theta, sin_theta, v_forward, health)
@@ -125,6 +126,7 @@ def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_veloci
         18-19: Step feedback (was_hit, hit_enemy)
         20-27: Enemy ray sensors
         28: Aim indicator (1.0 if on target and would hit)
+        29-36: Projectile ray sensors (normalized distance to nearest enemy projectile per ray)
     
     Args:
         agent_pos: np.array[2] agent position
@@ -137,10 +139,13 @@ def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_veloci
         arena_size: Size of the square arena
         was_hit_last_step: 1.0 if agent took damage last step, else 0.0
         hit_enemy_last_step: 1.0 if agent hit enemy last step, else 0.0
+        enemy_projectiles: list of {"pos": np.array, "vel": np.array} for enemy projectiles
     
     Returns:
-        np.array of 29 floats
+        np.array of 37 floats
     """
+    if enemy_projectiles is None:
+        enemy_projectiles = []
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     
     # Get agent state
@@ -284,6 +289,38 @@ def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_veloci
                 if not line_hits_obstacle(x_self, y_self, enemy_pos[0], enemy_pos[1], obstacles):
                     obs[28] = 1.0
     
+    # =========================================================================
+    # 3.7 Projectile ray sensors (indices 29-36)
+    # Normalized distance to nearest enemy projectile per ray (1.0 = no projectile)
+    # =========================================================================
+    for i in range(N_RAYS):
+        t = i / (N_RAYS - 1) if N_RAYS > 1 else 0.5
+        local_angle = -math.pi / 2 + t * math.pi
+        global_angle = theta_self + local_angle
+        
+        ray_dx = math.cos(global_angle)
+        ray_dy = math.sin(global_angle)
+        
+        min_proj_dist = RAY_MAX_RANGE
+        for proj in enemy_projectiles:
+            # Vector from agent to projectile
+            to_proj_x = proj["pos"][0] - x_self
+            to_proj_y = proj["pos"][1] - y_self
+            
+            # Project onto ray direction
+            proj_along_ray = to_proj_x * ray_dx + to_proj_y * ray_dy
+            if proj_along_ray > 0:  # Projectile is in front along this ray
+                # Perpendicular distance from ray to projectile
+                closest_x = ray_dx * proj_along_ray
+                closest_y = ray_dy * proj_along_ray
+                perp_dist = math.sqrt((to_proj_x - closest_x)**2 + (to_proj_y - closest_y)**2)
+                
+                # Detection radius: projectile radius * 2 for some tolerance
+                if perp_dist < PROJECTILE_RADIUS * 2:
+                    min_proj_dist = min(min_proj_dist, proj_along_ray)
+        
+        obs[29 + i] = min_proj_dist / RAY_MAX_RANGE
+    
     return obs
 
 
@@ -319,7 +356,7 @@ class Worms3DEnv(gym.Env):
         # Action: one discrete action per agent
         self.action_space = spaces.MultiDiscrete([self.N_ACTIONS] * self.n_agents)
         
-        # Observation: 20 dims per agent = 40 total
+        # Observation: 37 dims per agent = 74 total
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(OBS_DIM * self.n_agents,), dtype=np.float32
         )
@@ -374,12 +411,20 @@ class Worms3DEnv(gym.Env):
         # Exploration tracking - visited cells per agent
         self.visited = [set(), set()]
         
+        # Randomly swap observation order for symmetric learning
+        # If swapped=True, obs is [obs1, obs0] and actions are interpreted as [act1, act0]
+        self.obs_swapped = self.np_random.random() < 0.5
+        
         self.current_step = 0
         return self._get_obs(), {}
 
     def step(self, actions):
         # actions is array of shape (TOTAL_AGENTS,) - one action per agent
         # Action: 0=nothing, 1=up, 2=down, 3=left, 4=right, 5=rotate_left, 6=rotate_right, 7=shoot
+        
+        # If obs was swapped, swap actions back so they apply to correct agents
+        if self.obs_swapped:
+            actions = [actions[1], actions[0]]
         
         rewards = np.zeros(self.n_agents)
         self.last_shots = []  # Clear shots from previous step
@@ -483,20 +528,31 @@ class Worms3DEnv(gym.Env):
         return self._get_obs(), total_reward, terminated, truncated, {"alive_teams": list(alive_teams)}
 
     def _get_obs(self):
-        """Get 58-dim observation (29 per agent)."""
+        """Get 74-dim observation (37 per agent).
+        
+        If obs_swapped is True, returns [obs1, obs0] so the policy learns symmetrically.
+        """
         a0, a1 = self.agents[0], self.agents[1]
+        # Agent 0 sees agent 1's projectiles as enemy projectiles
         obs0 = compute_agent_observation(
             a0["pos"], a0["angle"], a0["health"], a0.get("velocity", np.array([0.0, 0.0])),
             a1["pos"], a1["alive"], self.OBSTACLES, self.SIZE,
             was_hit_last_step=self.was_hit[0],
-            hit_enemy_last_step=self.hit_enemy[0]
+            hit_enemy_last_step=self.hit_enemy[0],
+            enemy_projectiles=self.projectiles[1]
         )
+        # Agent 1 sees agent 0's projectiles as enemy projectiles
         obs1 = compute_agent_observation(
             a1["pos"], a1["angle"], a1["health"], a1.get("velocity", np.array([0.0, 0.0])),
             a0["pos"], a0["alive"], self.OBSTACLES, self.SIZE,
             was_hit_last_step=self.was_hit[1],
-            hit_enemy_last_step=self.hit_enemy[1]
+            hit_enemy_last_step=self.hit_enemy[1],
+            enemy_projectiles=self.projectiles[0]
         )
+        
+        # Swap observation order for symmetric learning
+        if self.obs_swapped:
+            return np.concatenate([obs1, obs0])
         return np.concatenate([obs0, obs1])
     
     def _update_projectiles(self):
