@@ -11,13 +11,13 @@ import math
 # Environment Constants
 # =============================================================================
 MAX_HEALTH = 100.0
-MAX_AMMO = 10
+MAX_AMMO = 5  # Starting ammo, requires pickup to refill
 MAX_COOLDOWN = 5  # steps
 DASH_COOLDOWN = 50  # ticks
 DASH_DISTANCE = 5.0  # units
 MAX_SPEED_FORWARD = 0.3  # units per step
 N_RAYS = 8
-RAY_MAX_RANGE = 30.0  # max ray distance (matches arena size)
+RAY_MAX_RANGE = 10.0  # max ray distance (matches arena size)
 
 # Projectile constants
 PROJECTILE_SPEED = 0.8
@@ -25,7 +25,7 @@ PROJECTILE_DAMAGE = 25
 PROJECTILE_RADIUS = 0.5  # Hit detection radius
 MAX_PROJECTILES = 5  # Max active projectiles per agent
 
-OBS_DIM = 37  # total observation dimensions (29 base + 8 projectile rays)
+OBS_DIM = 41  # total observation dimensions (29 base + 8 projectile rays + 4 ammo pickup)
 
 
 # =============================================================================
@@ -116,17 +116,21 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacles):
 def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_velocity,
                                enemy_pos, enemy_alive, obstacles, arena_size, 
                                was_hit_last_step=0.0, hit_enemy_last_step=0.0,
-                               enemy_projectiles=None):
-    """Compute 37-dimensional egocentric observation vector for a single agent.
+                               enemy_projectiles=None,
+                               ammo_pickup_pos=None, ammo_pickup_active=False,
+                               agent_ammo=0):
+    """Compute 41-dimensional egocentric observation vector for a single agent.
     
     Indices:
         0-3: Self state (cos_theta, sin_theta, v_forward, health)
+        4-5: Ammo info (ammo_norm, unused)
         6-9: Enemy info (cos_delta, sin_delta, dist, LOS)
         10-17: Wall ray sensors
         18-19: Step feedback (was_hit, hit_enemy)
         20-27: Enemy ray sensors
         28: Aim indicator (1.0 if on target and would hit)
         29-36: Projectile ray sensors (normalized distance to nearest enemy projectile per ray)
+        37-40: Ammo pickup info (cos_delta, sin_delta, dist, active)
     
     Args:
         agent_pos: np.array[2] agent position
@@ -140,9 +144,12 @@ def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_veloci
         was_hit_last_step: 1.0 if agent took damage last step, else 0.0
         hit_enemy_last_step: 1.0 if agent hit enemy last step, else 0.0
         enemy_projectiles: list of {"pos": np.array, "vel": np.array} for enemy projectiles
+        ammo_pickup_pos: np.array[2] position of ammo pickup
+        ammo_pickup_active: bool whether pickup is available
+        agent_ammo: int current ammo count
     
     Returns:
-        np.array of 37 floats
+        np.array of 41 floats
     """
     if enemy_projectiles is None:
         enemy_projectiles = []
@@ -171,6 +178,7 @@ def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_veloci
     obs[2] = np.clip(v_forward / MAX_SPEED_FORWARD, -1.0, 1.0)  # v_forward_norm
     
     obs[3] = np.clip(health / MAX_HEALTH, 0.0, 1.0)  # health_norm
+    obs[4] = np.clip(agent_ammo / MAX_AMMO, 0.0, 1.0)  # ammo_norm
     
     # =========================================================================
     # 3.2 Enemy info (indices 6-9)
@@ -321,6 +329,24 @@ def compute_agent_observation(agent_pos, agent_angle, agent_health, agent_veloci
         
         obs[29 + i] = min_proj_dist / RAY_MAX_RANGE
     
+    # =========================================================================
+    # 3.8 Ammo pickup info (indices 37-40)
+    # =========================================================================
+    if ammo_pickup_pos is not None:
+        dx_pickup = ammo_pickup_pos[0] - x_self
+        dy_pickup = ammo_pickup_pos[1] - y_self
+        dist_pickup = math.sqrt(dx_pickup * dx_pickup + dy_pickup * dy_pickup)
+        
+        if dist_pickup > 0.001:
+            angle_to_pickup = math.atan2(dy_pickup, dx_pickup)
+            delta_theta_pickup = angle_to_pickup - theta_self
+            
+            obs[37] = math.cos(delta_theta_pickup)  # cos_delta_pickup
+            obs[38] = math.sin(delta_theta_pickup)  # sin_delta_pickup
+        
+        obs[39] = np.clip(dist_pickup / max_enemy_dist, 0.0, 1.0)  # dist_pickup_norm
+        obs[40] = 1.0 if ammo_pickup_active else 0.0  # pickup_active
+    
     return obs
 
 
@@ -332,19 +358,15 @@ class Worms3DEnv(gym.Env):
     # Grid size
     SIZE = 30
     
-    # Multiple obstacles for interesting arena layout
-    # Each obstacle: [x_min, y_min, x_max, y_max]
-    OBSTACLES = [
-        #[13, 13, 17, 17],  # Small center block
-        #[5, 12, 8, 18],    # Left cover
-        #[22, 12, 25, 18],  # Right cover  
-        #[12, 4, 18, 7],    # Bottom wall
-        #[12, 23, 18, 26],  # Top wall
-        [12.5, 12.5, 17.5, 17.5],  # Top wall
-    ]
+    # No obstacles - open arena
+    OBSTACLES = []
+    
+    # Ammo pickup settings
+    AMMO_PICKUP_RADIUS = 1.0  # Pickup radius
+    AMMO_REFILL_AMOUNT = 5  # How much ammo the pickup gives
         
-    # Actions: 0=nothing, 1=up, 2=down, 3=left, 4=right, 5=rotate_left, 6=rotate_right, 7=shoot, 8=dash
-    N_ACTIONS = 9
+    # Actions: 0=nothing, 1=up, 2=down, 3=left, 4=right, 5=rotate_left, 6=rotate_right, 7=shoot, 8=dash_forward, 9=dash_left, 10=dash_right
+    N_ACTIONS = 11
     
     def __init__(self, render_mode=None):
         super().__init__()
@@ -411,6 +433,11 @@ class Worms3DEnv(gym.Env):
         # Exploration tracking - visited cells per agent
         self.visited = [set(), set()]
         
+        # Ammo pickup spawns in center
+        self.ammo_pickup_pos = np.array([self.SIZE / 2, self.SIZE / 2])
+        self.ammo_pickup_active = True
+        self.ammo_respawn_timer = 0
+        
         # Randomly swap observation order for symmetric learning
         # If swapped=True, obs is [obs1, obs0] and actions are interpreted as [act1, act0]
         self.obs_swapped = self.np_random.random() < 0.5
@@ -460,9 +487,10 @@ class Worms3DEnv(gym.Env):
             elif act == 6:  # Rotate right (clockwise)
                 agent["angle"] -= ROTATE_STEP
             
-            # Shoot projectile (7)
+            # Shoot projectile (7) - requires ammo
             elif act == 7:
-                if len(self.projectiles[i]) < MAX_PROJECTILES:
+                if agent["ammo"] > 0 and len(self.projectiles[i]) < MAX_PROJECTILES:
+                    agent["ammo"] -= 1
                     dx = math.cos(agent["angle"])
                     dy = math.sin(agent["angle"])
                     self.projectiles[i].append({
@@ -481,12 +509,40 @@ class Worms3DEnv(gym.Env):
                     agent["pos"][1] += dy * DASH_DISTANCE
                     agent["dash_cooldown"] = DASH_COOLDOWN
             
+            # Dash left (9) - 90 degrees counter-clockwise from facing
+            elif act == 9:
+                if agent["dash_cooldown"] <= 0:
+                    dash_angle = agent["angle"] + math.pi / 2
+                    dx = math.cos(dash_angle)
+                    dy = math.sin(dash_angle)
+                    agent["pos"][0] += dx * DASH_DISTANCE
+                    agent["pos"][1] += dy * DASH_DISTANCE
+                    agent["dash_cooldown"] = DASH_COOLDOWN
+            
+            # Dash right (10) - 90 degrees clockwise from facing
+            elif act == 10:
+                if agent["dash_cooldown"] <= 0:
+                    dash_angle = agent["angle"] - math.pi / 2
+                    dx = math.cos(dash_angle)
+                    dy = math.sin(dash_angle)
+                    agent["pos"][0] += dx * DASH_DISTANCE
+                    agent["pos"][1] += dy * DASH_DISTANCE
+                    agent["dash_cooldown"] = DASH_COOLDOWN
+            
             # Decrement dash cooldown
             if agent["dash_cooldown"] > 0:
                 agent["dash_cooldown"] -= 1
             
             # Collision / Boundary Check
             self._handle_collision(agent)
+            
+            # Check ammo pickup collision
+            if self.ammo_pickup_active:
+                dist_to_pickup = np.linalg.norm(agent["pos"] - self.ammo_pickup_pos)
+                if dist_to_pickup < self.AMMO_PICKUP_RADIUS:
+                    agent["ammo"] = min(agent["ammo"] + self.AMMO_REFILL_AMOUNT, MAX_AMMO)
+                    self.ammo_pickup_active = False
+                    self.ammo_respawn_timer = 50  # Respawn after 50 steps
             
             # =================================================================
             # SIMPLE REWARD SYSTEM: Only hits and kills + exploration
@@ -501,6 +557,12 @@ class Worms3DEnv(gym.Env):
         # Update projectiles and apply damage
         self._update_projectiles()
         
+        # Update ammo respawn timer
+        if not self.ammo_pickup_active:
+            self.ammo_respawn_timer -= 1
+            if self.ammo_respawn_timer <= 0:
+                self.ammo_pickup_active = True
+        
         # Damage rewards (computed after all actions processed)
         for i, agent in enumerate(self.agents):
             enemy = self.agents[1 - i]
@@ -510,10 +572,18 @@ class Worms3DEnv(gym.Env):
             if enemy_damage > 0 and self.hit_enemy[i] > 0:
                 rewards[i] += enemy_damage  # +25 per hit
             
-            # Kill bonus (no death penalty - we want aggressive play)
-            # Since rewards are summed, death penalty would cancel out kill bonus
+            # Penalty for taking damage - encourages dodging
+            self_damage = prev_health[i] - agent["health"]
+            if self_damage > 0:
+                rewards[i] -= self_damage * 0.5  # -12.5 per hit taken (half of damage dealt reward)
+            
+            # Kill bonus
             if prev_health[1 - i] > 0 and not enemy["alive"]:
                 rewards[i] += 500  # Reward for killing
+            
+            # Death penalty - encourages survival/dodging
+            if prev_health[i] > 0 and not agent["alive"]:
+                rewards[i] -= 250  # Penalty for dying
 
         # Track steps
         self.current_step = getattr(self, 'current_step', 0) + 1
@@ -528,7 +598,7 @@ class Worms3DEnv(gym.Env):
         return self._get_obs(), total_reward, terminated, truncated, {"alive_teams": list(alive_teams)}
 
     def _get_obs(self):
-        """Get 74-dim observation (37 per agent).
+        """Get 82-dim observation (41 per agent).
         
         If obs_swapped is True, returns [obs1, obs0] so the policy learns symmetrically.
         """
@@ -539,7 +609,10 @@ class Worms3DEnv(gym.Env):
             a1["pos"], a1["alive"], self.OBSTACLES, self.SIZE,
             was_hit_last_step=self.was_hit[0],
             hit_enemy_last_step=self.hit_enemy[0],
-            enemy_projectiles=self.projectiles[1]
+            enemy_projectiles=self.projectiles[1],
+            ammo_pickup_pos=self.ammo_pickup_pos,
+            ammo_pickup_active=self.ammo_pickup_active,
+            agent_ammo=a0["ammo"]
         )
         # Agent 1 sees agent 0's projectiles as enemy projectiles
         obs1 = compute_agent_observation(
@@ -547,7 +620,10 @@ class Worms3DEnv(gym.Env):
             a0["pos"], a0["alive"], self.OBSTACLES, self.SIZE,
             was_hit_last_step=self.was_hit[1],
             hit_enemy_last_step=self.hit_enemy[1],
-            enemy_projectiles=self.projectiles[0]
+            enemy_projectiles=self.projectiles[0],
+            ammo_pickup_pos=self.ammo_pickup_pos,
+            ammo_pickup_active=self.ammo_pickup_active,
+            agent_ammo=a1["ammo"]
         )
         
         # Swap observation order for symmetric learning

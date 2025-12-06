@@ -92,7 +92,7 @@ class PygameRenderer:
         sy = int((self.map_depth - 1 - y) * self.scale)  # Flip Y axis
         return sx, sy
     
-    def record_state(self, agents, shots=None, obs=None):
+    def record_state(self, agents, shots=None, obs=None, ammo_pickup=None):
         """Record current state for replay."""
         agent_snapshot = []
         for a in agents:
@@ -101,7 +101,8 @@ class PygameRenderer:
                 "health": a["health"],
                 "team": a["team"],
                 "angle": a.get("angle", 0),
-                "alive": a["alive"]
+                "alive": a["alive"],
+                "ammo": a.get("ammo", 0)
             })
         
         shot_snapshot = []
@@ -123,18 +124,34 @@ class PygameRenderer:
                         "team": s.get("team", 0)
                     })
         
+        # Record ammo pickup state
+        ammo_snapshot = None
+        if ammo_pickup is not None:
+            ammo_snapshot = {
+                "pos": ammo_pickup["pos"].copy(),
+                "active": ammo_pickup["active"]
+            }
+        
         self.history.append({
             "agents": agent_snapshot, 
             "shots": shot_snapshot,
-            "obs": obs.copy() if obs is not None else None
+            "obs": obs.copy() if obs is not None else None,
+            "ammo_pickup": ammo_snapshot
         })
     
     def clear_history(self):
         """Clear recorded history."""
         self.history = []
     
-    def render_frame(self, agents, shots=None, step=None):
-        """Render a single frame."""
+    def render_frame(self, agents, shots=None, step=None, ammo_pickup=None):
+        """Render a single frame.
+        
+        Args:
+            agents: List of agent dicts
+            shots: List of projectile dicts
+            step: Current step number
+            ammo_pickup: Dict with 'pos' and 'active' keys, or None
+        """
         self.init()
         
         # Handle pygame events
@@ -158,6 +175,18 @@ class PygameRenderer:
             obstacle_rect = pygame.Rect(ox1, oy1, ox2 - ox1, oy2 - oy1)
             pygame.draw.rect(self.screen, (101, 67, 33), obstacle_rect)  # Dark brown fill
             pygame.draw.rect(self.screen, BLACK, obstacle_rect, 3)  # Black border
+        
+        # Draw ammo pickup (yellow/gold box)
+        if ammo_pickup and ammo_pickup.get("active", False):
+            px, py = self.world_to_screen(ammo_pickup["pos"][0], ammo_pickup["pos"][1])
+            pickup_radius = int(self.scale * 0.5)
+            pygame.draw.rect(self.screen, (255, 215, 0),  # Gold
+                           (px - pickup_radius, py - pickup_radius, pickup_radius * 2, pickup_radius * 2))
+            pygame.draw.rect(self.screen, BLACK,
+                           (px - pickup_radius, py - pickup_radius, pickup_radius * 2, pickup_radius * 2), 2)
+            # Draw "A" for ammo
+            ammo_label = self.font.render("A", True, BLACK)
+            self.screen.blit(ammo_label, (px - 5, py - 8))
         
         # Draw shots/projectiles
         if shots:
@@ -255,7 +284,7 @@ class PygameRenderer:
         # Get latest frame from stacked observation
         # Frame stacking: 4 frames x 74 dims = 296 total (37 per agent x 2 agents)
         obs = self.current_obs.flatten()
-        agent_obs_dim = 37  # Updated observation dimension per agent (29 base + 8 projectile rays)
+        agent_obs_dim = 41  # Updated observation dimension per agent (29 base + 8 projectile rays + 4 ammo pickup)
         total_obs_dim = agent_obs_dim * 2  # 74 for both agents
         
         if len(obs) >= total_obs_dim * 4:
@@ -585,7 +614,8 @@ def run_with_pygame_renderer():
         # Reset environment
         obs = env.reset()
         renderer.set_observation(obs)
-        renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs)
+        ammo_pickup = {"pos": unwrapped.ammo_pickup_pos, "active": unwrapped.ammo_pickup_active}
+        renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs, ammo_pickup)
         
         print(f"\n=== Starting Episode {episode} ===")
         total_reward = 0
@@ -620,11 +650,12 @@ def run_with_pygame_renderer():
             total_reward += reward[0]
             
             renderer.set_observation(obs)
-            renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs)
+            ammo_pickup = {"pos": unwrapped.ammo_pickup_pos, "active": unwrapped.ammo_pickup_active}
+            renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs, ammo_pickup)
             
             # Log step
             flat_obs = obs[0]
-            agent_obs_dim = 37
+            agent_obs_dim = 41
             total_obs_dim = agent_obs_dim * 2
             latest_frame_start = 3 * total_obs_dim
             a0_cos_delta = flat_obs[latest_frame_start + 6]
@@ -633,7 +664,9 @@ def run_with_pygame_renderer():
             a1_has_los = flat_obs[latest_frame_start + agent_obs_dim + 9]
             aim0 = "AIM!" if (a0_cos_delta > 0.9 and a0_has_los > 0.5) else "    "
             aim1 = "AIM!" if (a1_cos_delta > 0.9 and a1_has_los > 0.5) else "    "
-            print(f"Step {step:3}: A0={a0_name:10} {aim0} | A1={a1_name:10} {aim1} | HP: {new_hp[0]:.0f} vs {new_hp[1]:.0f}")
+            ammo0 = unwrapped.agents[0]["ammo"]
+            ammo1 = unwrapped.agents[1]["ammo"]
+            print(f"Step {step:3}: A0={a0_name:10} {aim0} | A1={a1_name:10} {aim1} | HP: {new_hp[0]:.0f} vs {new_hp[1]:.0f} | Ammo: {ammo0} vs {ammo1}")
             
             if terminated:
                 break
@@ -664,7 +697,8 @@ def run_with_pygame_renderer():
             
             if state.get("obs") is not None:
                 renderer.current_obs = state["obs"]
-            renderer.render_frame(state["agents"], shots=state.get("shots", []), step=i)
+            renderer.render_frame(state["agents"], shots=state.get("shots", []), step=i, 
+                                 ammo_pickup=state.get("ammo_pickup"))
             renderer.clock.tick(15)
         
         if not running:
