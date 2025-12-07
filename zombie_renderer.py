@@ -50,9 +50,6 @@ class ZombieRenderer:
     HEALTH_BAR_PLAYER = (50, 200, 100)
     HEALTH_BAR_ZOMBIE = (200, 60, 60)
     
-    POWERUP_COLOR = (100, 200, 255)
-    SPEED_BOOST_INDICATOR = (255, 200, 50)
-    
     UI_TEXT_COLOR = (220, 220, 220)
     UI_BG_COLOR = (30, 30, 40, 200)
     
@@ -114,14 +111,13 @@ class ZombieRenderer:
         sy = int((self.map_depth - 1 - y) * self.scale)  # Flip Y axis
         return sx, sy
     
-    def record_state(self, agent, zombies, shots=None, obs=None, kills=0, powerups=None):
+    def record_state(self, agent, zombies, shots=None, obs=None, kills=0):
         """Record current state for replay."""
         agent_snapshot = {
             "pos": agent["pos"].copy(),
             "health": agent["health"],
             "angle": agent.get("angle", 0),
-            "alive": agent["alive"],
-            "speed_boost": agent.get("speed_boost", 0)
+            "alive": agent["alive"]
         }
         
         zombie_snapshot = []
@@ -150,22 +146,12 @@ class ZombieRenderer:
                         "hit": s.get("hit", False)
                     })
         
-        powerup_snapshot = []
-        if powerups:
-            for p in powerups:
-                powerup_snapshot.append({
-                    "pos": p["pos"].copy(),
-                    "type": p["type"],
-                    "active": p["active"]
-                })
-        
         self.history.append({
             "agent": agent_snapshot,
             "zombies": zombie_snapshot,
             "shots": shot_snapshot,
             "obs": obs.copy() if obs is not None else None,
-            "kills": kills,
-            "powerups": powerup_snapshot
+            "kills": kills
         })
     
     def clear_history(self):
@@ -207,10 +193,6 @@ class ZombieRenderer:
         end_x = sx + math.cos(angle) * dir_len
         end_y = sy - math.sin(angle) * dir_len  # Flip Y
         pygame.draw.line(self.screen, BLACK, (sx, sy), (int(end_x), int(end_y)), 3)
-        
-        # Speed boost indicator
-        if agent.get("speed_boost", 0) > 0:
-            pygame.draw.circle(self.screen, self.SPEED_BOOST_INDICATOR, (sx, sy), radius + 4, 2)
         
         # Health bar
         health_pct = agent["health"] / 100.0
@@ -270,23 +252,7 @@ class ZombieRenderer:
                 color = self.SHOT_COLOR_HIT if shot.get("hit") else self.PLAYER_COLOR
                 pygame.draw.line(self.screen, color, (ox, oy), (int(end_x), int(end_y)), 2)
     
-    def _draw_powerups(self, powerups):
-        """Draw powerups."""
-        for powerup in powerups:
-            if not powerup.get("active", True):
-                continue
-                
-            pos = powerup["pos"]
-            sx, sy = self.world_to_screen(pos[0], pos[1])
-            
-            # Pulsing effect based on time
-            pulse = abs(math.sin(pygame.time.get_ticks() / 200)) * 0.3 + 0.7
-            radius = int(0.4 * self.scale * pulse)
-            
-            pygame.draw.circle(self.screen, self.POWERUP_COLOR, (sx, sy), radius)
-            pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), radius, 2)
-    
-    def render_frame(self, agent, zombies, shots=None, step=None, kills=0, powerups=None):
+    def render_frame(self, agent, zombies, shots=None, step=None, kills=0):
         """Render a single frame."""
         self.init()
         
@@ -303,10 +269,6 @@ class ZombieRenderer:
         
         # Draw obstacles
         self._draw_obstacles()
-        
-        # Draw powerups
-        if powerups:
-            self._draw_powerups(powerups)
         
         # Draw shots
         if shots:
@@ -334,10 +296,6 @@ class ZombieRenderer:
         hp_text = self.font.render(f"HP: {int(agent['health'])}", True, BLACK)
         self.screen.blit(hp_text, (10, 70))
         
-        if agent.get("speed_boost", 0) > 0:
-            boost_text = self.font.render(f"SPEED BOOST: {agent['speed_boost']}", True, self.SPEED_BOOST_INDICATOR)
-            self.screen.blit(boost_text, (10, 90))
-        
         # Draw observation panel
         if self.show_obs and self.current_obs is not None:
             self._render_obs_panel()
@@ -359,8 +317,8 @@ class ZombieRenderer:
         
         # Get latest frame from stacked observation
         obs = self.current_obs.flatten()
-        agent_obs_dim = 38  # 28 base + 3 powerup + 1 aim + 4 second zombie + 2 counts
-        total_obs_dim = agent_obs_dim * 2  # 76 for zombie env (duplicated)
+        agent_obs_dim = 23  # New simplified observation
+        total_obs_dim = agent_obs_dim * 2  # 46 for zombie env (duplicated)
         
         if len(obs) >= total_obs_dim * 4:
             # Get last frame from stacked obs
@@ -369,7 +327,7 @@ class ZombieRenderer:
         elif len(obs) >= total_obs_dim:
             obs = obs[:total_obs_dim]
         
-        # Use first 38 dims (player observation)
+        # Use first 23 dims (player observation)
         agent_obs = obs[:agent_obs_dim] if len(obs) >= agent_obs_dim else obs
         
         y_start = 10
@@ -381,60 +339,37 @@ class ZombieRenderer:
         
         y = y_start
         
-        # Self state (0-3)
+        # Health (0)
         y = self._draw_obs_section(panel_x, y, "Self State", [
-            ("cos θ", agent_obs[0]),
-            ("sin θ", agent_obs[1]),
-            ("v_fwd", agent_obs[2]),
-            ("health", agent_obs[3]),
+            ("health", agent_obs[0]),
         ])
         
-        # Enemy info (6-9) - closest zombie
+        # Closest zombie (1-4)
         y = self._draw_obs_section(panel_x, y, "Closest Zombie", [
-            ("cos Δ", agent_obs[6]),
-            ("sin Δ", agent_obs[7]),
-            ("dist", agent_obs[8]),
-            ("LOS", agent_obs[9]),
+            ("cos Δ", agent_obs[1]),
+            ("sin Δ", agent_obs[2]),
+            ("dist", agent_obs[3]),
+            ("LOS", agent_obs[4]),
         ])
         
-        # Ray sensors visualization
-        enemy_rays = agent_obs[20:28] if len(agent_obs) >= 28 else [0]*8
-        y = self._draw_ray_viz(panel_x, y, agent_obs[10:18], agent_obs[0], agent_obs[1], enemy_rays)
+        # Ray sensors visualization (5-12 wall, 13-20 enemy)
+        wall_rays = agent_obs[5:13] if len(agent_obs) >= 13 else [0]*8
+        enemy_rays = agent_obs[13:21] if len(agent_obs) >= 21 else [0]*8
+        # Use cos/sin from zombie direction for heading indicator
+        cos_theta = agent_obs[1] if len(agent_obs) > 1 else 1.0
+        sin_theta = agent_obs[2] if len(agent_obs) > 2 else 0.0
+        y = self._draw_ray_viz(panel_x, y, wall_rays, cos_theta, sin_theta, enemy_rays)
         
-        # Step feedback (18-19)
-        y = self._draw_obs_section(panel_x, y, "Feedback", [
-            ("was_hit", agent_obs[18]),
-            ("hit_enemy", agent_obs[19]),
-        ])
-        
-        # Powerup info (28-30)
-        if len(agent_obs) >= 31:
-            y = self._draw_obs_section(panel_x, y, "Closest Powerup", [
-                ("cos Δ", agent_obs[28]),
-                ("sin Δ", agent_obs[29]),
-                ("dist", agent_obs[30]),
-            ])
-        
-        # Aim indicator (31)
-        if len(agent_obs) >= 32:
+        # Aim indicator (21)
+        if len(agent_obs) >= 22:
             y = self._draw_obs_section(panel_x, y, "Aim", [
-                ("on_target", agent_obs[31]),
+                ("on_target", agent_obs[21]),
             ])
         
-        # 2nd closest zombie (32-35)
-        if len(agent_obs) >= 36:
-            y = self._draw_obs_section(panel_x, y, "2nd Zombie", [
-                ("cos Δ", agent_obs[32]),
-                ("sin Δ", agent_obs[33]),
-                ("dist", agent_obs[34]),
-                ("LOS", agent_obs[35]),
-            ])
-        
-        # Shots and zombie count (36-37)
-        if len(agent_obs) >= 38:
+        # Shots remaining (22)
+        if len(agent_obs) >= 23:
             y = self._draw_obs_section(panel_x, y, "Status", [
-                ("shots_left", agent_obs[36]),
-                ("zombie_cnt", agent_obs[37]),
+                ("shots_left", agent_obs[22]),
             ])
     
     def _draw_obs_section(self, panel_x, y, title, items):
@@ -525,8 +460,7 @@ class ZombieRenderer:
                 state["zombies"], 
                 shots=state.get("shots", []),
                 step=i,
-                kills=state.get("kills", 0),
-                powerups=state.get("powerups", [])
+                kills=state.get("kills", 0)
             ):
                 break
             self.clock.tick(fps)
@@ -581,8 +515,7 @@ def run_zombie_renderer():
         unwrapped.zombies, 
         unwrapped.last_shots, 
         obs,
-        kills=unwrapped.kills,
-        powerups=getattr(unwrapped, 'powerups', [])
+        kills=unwrapped.kills
     )
     
     print("Running zombie survival simulation...")
@@ -626,8 +559,7 @@ def run_zombie_renderer():
             unwrapped.zombies, 
             unwrapped.last_shots, 
             obs,
-            kills=unwrapped.kills,
-            powerups=getattr(unwrapped, 'powerups', [])
+            kills=unwrapped.kills
         )
         
         # Log every 50 steps
@@ -647,8 +579,7 @@ def run_zombie_renderer():
                 unwrapped.zombies, 
                 unwrapped.last_shots, 
                 obs,
-                kills=unwrapped.kills,
-                powerups=getattr(unwrapped, 'powerups', [])
+                kills=unwrapped.kills
             )
     
     env.close()
