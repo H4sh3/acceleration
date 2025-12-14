@@ -30,16 +30,14 @@ GRAY = (128, 128, 128)
 
 
 class ZombieRenderer:
-    """Pygame-based renderer for the zombie survival environment."""
+    """Pygame-based renderer for the zombie survival environment (infinite world)."""
     
     # Colors
-    BG_COLOR = (20, 20, 30)
-    GRID_COLOR = (40, 40, 50)
-    WALL_COLOR = (80, 80, 90)
-    OBSTACLE_COLOR = (101, 67, 33)  # Dark brown like pygame_renderer
+    BG_COLOR = (20, 100, 20)
+    GRID_COLOR = (0, 80, 0)
     
-    PLAYER_COLOR = (50, 200, 100)
-    PLAYER_OUTLINE = (30, 150, 70)
+    PLAYER_COLOR = (50, 100, 255)
+    PLAYER_OUTLINE = (30, 70, 200)
     ZOMBIE_COLOR = (200, 60, 60)
     ZOMBIE_OUTLINE = (150, 40, 40)
     
@@ -53,28 +51,25 @@ class ZombieRenderer:
     UI_TEXT_COLOR = (220, 220, 220)
     UI_BG_COLOR = (30, 30, 40, 200)
     
-    def __init__(self, map_width, map_depth, scale=20, show_obs=True, obstacles=None):
+    def __init__(self, view_size=40, scale=15, show_obs=True):
         """
-        Top-down 2D renderer for Zombie Survival environment.
+        Top-down 2D renderer for Zombie Survival environment (infinite world).
+        Agent-centered camera.
         
         Args:
-            map_width: Width of the map in world units
-            map_depth: Depth of the map in world units  
+            view_size: World units visible around agent
             scale: Pixels per world unit
             show_obs: Whether to show observation panel
-            obstacles: List of [x_min, y_min, x_max, y_max] obstacle bounds
         """
-        self.map_width = map_width
-        self.map_depth = map_depth
+        self.view_size = view_size
         self.scale = scale
         self.show_obs = show_obs
-        self.obstacles = obstacles or []
         
-        self.game_width = map_width * scale
-        self.game_height = map_depth * scale
+        self.game_width = view_size * scale
+        self.game_height = view_size * scale
         
         # Add observation panel width if enabled
-        self.obs_panel_width = 300 if show_obs else 0
+        self.obs_panel_width = 250 if show_obs else 0
         self.screen_width = self.game_width + self.obs_panel_width
         self.screen_height = self.game_height
         
@@ -86,6 +81,9 @@ class ZombieRenderer:
         
         # Current observation for visualization
         self.current_obs = None
+        
+        # Current agent position for camera
+        self.agent_pos = np.array([0.0, 0.0])
         
         # State history for replay
         self.history = []
@@ -106,9 +104,11 @@ class ZombieRenderer:
         self.current_obs = obs
     
     def world_to_screen(self, x, y):
-        """Convert world coordinates to screen coordinates."""
-        sx = int(x * self.scale)
-        sy = int((self.map_depth - 1 - y) * self.scale)  # Flip Y axis
+        """Convert world coordinates to screen coordinates (agent-centered)."""
+        rel_x = x - self.agent_pos[0]
+        rel_y = y - self.agent_pos[1]
+        sx = int(self.game_width / 2 + rel_x * self.scale)
+        sy = int(self.game_height / 2 - rel_y * self.scale)  # Flip Y axis
         return sx, sy
     
     def record_state(self, agent, zombies, shots=None, obs=None, kills=0):
@@ -159,20 +159,26 @@ class ZombieRenderer:
         self.history = []
     
     def _draw_grid(self):
-        """Draw background grid."""
-        for x in range(0, self.game_width, self.scale * 5):
-            pygame.draw.line(self.screen, GRAY, (x, 0), (x, self.game_height), 1)
-        for y in range(0, self.game_height, self.scale * 5):
-            pygame.draw.line(self.screen, GRAY, (0, y), (self.game_width, y), 1)
+        """Draw background grid (relative to agent position)."""
+        grid_spacing = 5
+        offset_x = self.agent_pos[0] % grid_spacing
+        offset_y = self.agent_pos[1] % grid_spacing
+        
+        for i in range(-self.view_size // grid_spacing - 1, self.view_size // grid_spacing + 2):
+            # Vertical lines
+            world_x = i * grid_spacing - offset_x + self.agent_pos[0]
+            sx, _ = self.world_to_screen(world_x, 0)
+            pygame.draw.line(self.screen, self.GRID_COLOR, (sx, 0), (sx, self.game_height), 1)
+            # Horizontal lines
+            world_y = i * grid_spacing - offset_y + self.agent_pos[1]
+            _, sy = self.world_to_screen(0, world_y)
+            pygame.draw.line(self.screen, self.GRID_COLOR, (0, sy), (self.game_width, sy), 1)
     
-    def _draw_obstacles(self):
-        """Draw obstacles."""
-        for obs in self.obstacles:
-            ox1, oy1 = self.world_to_screen(obs[0], obs[3])  # Top-left in screen
-            ox2, oy2 = self.world_to_screen(obs[2], obs[1])  # Bottom-right in screen
-            obstacle_rect = pygame.Rect(ox1, oy1, ox2 - ox1, oy2 - oy1)
-            pygame.draw.rect(self.screen, self.OBSTACLE_COLOR, obstacle_rect)
-            pygame.draw.rect(self.screen, BLACK, obstacle_rect, 3)
+    def _draw_range_circle(self):
+        """Draw aiming range circle around agent."""
+        center = (self.game_width // 2, self.game_height // 2)
+        range_radius = int(7.0 * self.scale)  # PROJECTILE_MAX_RANGE
+        pygame.draw.circle(self.screen, (0, 60, 0), center, range_radius, 1)
     
     def _draw_player(self, agent):
         """Draw the player."""
@@ -182,8 +188,9 @@ class ZombieRenderer:
         pos = agent["pos"]
         sx, sy = self.world_to_screen(pos[0], pos[1])
         
-        # Player body (circle)
-        radius = int(self.scale * 0.5)
+        # Player body (circle) - always at center
+        sx, sy = self.game_width // 2, self.game_height // 2
+        radius = int(self.scale * 0.6)
         pygame.draw.circle(self.screen, self.PLAYER_COLOR, (sx, sy), radius)
         pygame.draw.circle(self.screen, BLACK, (sx, sy), radius, 2)
         
@@ -256,19 +263,22 @@ class ZombieRenderer:
         """Render a single frame."""
         self.init()
         
+        # Update agent position for camera
+        self.agent_pos = agent["pos"].copy()
+        
         # Handle pygame events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
         
-        # Clear screen - tan background like pygame_renderer
-        self.screen.fill((210, 180, 140))
+        # Clear screen - dark green background
+        self.screen.fill(self.BG_COLOR)
         
         # Draw grid
         self._draw_grid()
         
-        # Draw obstacles
-        self._draw_obstacles()
+        # Draw range circle
+        self._draw_range_circle()
         
         # Draw shots
         if shots:
@@ -296,6 +306,9 @@ class ZombieRenderer:
         hp_text = self.font.render(f"HP: {int(agent['health'])}", True, BLACK)
         self.screen.blit(hp_text, (10, 70))
         
+        pos_text = self.font.render(f"Pos: ({int(agent['pos'][0])}, {int(agent['pos'][1])})", True, BLACK)
+        self.screen.blit(pos_text, (10, 90))
+        
         # Draw observation panel
         if self.show_obs and self.current_obs is not None:
             self._render_obs_panel()
@@ -317,8 +330,8 @@ class ZombieRenderer:
         
         # Get latest frame from stacked observation
         obs = self.current_obs.flatten()
-        agent_obs_dim = 27  # 1 health + 2 zombies x 4 + 8 wall + 1 shots + 9 quadrants
-        total_obs_dim = agent_obs_dim * 2  # 54 for zombie env (duplicated)
+        agent_obs_dim = 14  # 1 health + 2 zombies x 4 + 1 shots + 4 move toggles
+        total_obs_dim = agent_obs_dim * 2  # 28 for zombie env (duplicated)
         
         if len(obs) >= total_obs_dim * 4:
             # Get last frame from stacked obs
@@ -327,7 +340,7 @@ class ZombieRenderer:
         elif len(obs) >= total_obs_dim:
             obs = obs[:total_obs_dim]
         
-        # Use first 27 dims (player observation)
+        # Use first 14 dims (player observation)
         agent_obs = obs[:agent_obs_dim] if len(obs) >= agent_obs_dim else obs
         
         y_start = 10
@@ -356,17 +369,19 @@ class ZombieRenderer:
                 ("in_range", agent_obs[base_idx + 3]),
             ])
         
-        # Ray sensors visualization (9-16 wall only)
-        wall_rays = agent_obs[9:17] if len(agent_obs) >= 17 else [0]*8
-        # Use cos/sin from closest zombie direction for heading indicator
-        cos_theta = agent_obs[1] if len(agent_obs) > 1 else 1.0
-        sin_theta = agent_obs[2] if len(agent_obs) > 2 else 0.0
-        y = self._draw_ray_viz(panel_x, y, wall_rays, cos_theta, sin_theta, None)
-        
-        # Shots remaining (17)
-        if len(agent_obs) >= 18:
+        # Shots remaining (9)
+        if len(agent_obs) >= 10:
             y = self._draw_obs_section(panel_x, y, "Status", [
-                ("shots_left", agent_obs[17]),
+                ("shots_left", agent_obs[9]),
+            ])
+        
+        # Movement toggles (10-13)
+        if len(agent_obs) >= 14:
+            y = self._draw_obs_section(panel_x, y, "Movement", [
+                ("up", agent_obs[10]),
+                ("down", agent_obs[11]),
+                ("left", agent_obs[12]),
+                ("right", agent_obs[13]),
             ])
     
     def _draw_obs_section(self, panel_x, y, title, items):
@@ -477,7 +492,7 @@ class ZombieRenderer:
 
 
 def run_zombie_renderer():
-    """Run 5 zombie environments, pick the one with most kills, and render it."""
+    """Run zombie environments, pick the one with most kills, and render it."""
     import gymnasium as gym
     import worms_3d_gym
     from stable_baselines3 import PPO
@@ -490,8 +505,8 @@ def run_zombie_renderer():
         print(f"Loading model from {model_path}")
         model = PPO.load(model_path)
     
-    # Run 5 episodes and record each
-    num_runs = 50
+    # Run episodes and record each
+    num_runs = 25
     all_histories = []
     all_kills = []
     
@@ -505,10 +520,9 @@ def run_zombie_renderer():
         
         # Create renderer for recording (not displaying yet)
         renderer = ZombieRenderer(
-            map_width=unwrapped.SIZE,
-            map_depth=unwrapped.SIZE,
-            scale=20,
-            obstacles=unwrapped.OBSTACLES
+            view_size=40,
+            scale=15,
+            show_obs=True
         )
         
         # Run simulation
@@ -517,7 +531,7 @@ def run_zombie_renderer():
         renderer.record_state(
             unwrapped.agent, 
             unwrapped.zombies, 
-            unwrapped.last_shots, 
+            unwrapped.projectiles, 
             obs,
             kills=unwrapped.kills
         )
@@ -527,18 +541,16 @@ def run_zombie_renderer():
             if model:
                 action, _ = model.predict(obs, deterministic=True)
             else:
-                action = env.action_space.sample()
+                action = [env.action_space.sample()]
             
-            action = action.flatten()
-            
-            obs, reward, done, info = env.step([action])
+            obs, reward, done, info = env.step(action)
             terminated = done[0]
             
             renderer.set_observation(obs)
             renderer.record_state(
                 unwrapped.agent, 
                 unwrapped.zombies, 
-                unwrapped.last_shots, 
+                unwrapped.projectiles, 
                 obs,
                 kills=unwrapped.kills
             )
@@ -564,18 +576,12 @@ def run_zombie_renderer():
     print(f"All kills: {all_kills}")
     
     # Create renderer for playback
-    env = DummyVecEnv([lambda: gym.make("ZombieSurvival-v0")])
-    unwrapped = env.envs[0].unwrapped
-    
     renderer = ZombieRenderer(
-        map_width=unwrapped.SIZE,
-        map_depth=unwrapped.SIZE,
-        scale=20,
-        obstacles=unwrapped.OBSTACLES
+        view_size=40,
+        scale=15,
+        show_obs=True
     )
     renderer.history = best_history
-    
-    env.close()
     
     print(f"Playing back best episode ({len(best_history)} frames)...")
     renderer.play_history(fps=10)
