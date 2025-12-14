@@ -1,3 +1,4 @@
+"""Train an agent on the Zombie Survival environment."""
 import sys
 import os
 from datetime import datetime
@@ -8,34 +9,33 @@ import worms_3d_gym
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFrameStack
 from stable_baselines3.common.monitor import Monitor
 
-# Number of parallel environments
-N_ENVS = 8
 
 def make_env(log_dir, rank):
     """Create a monitored environment."""
     def _init():
-        env = gym.make("Worms3D-v0", render_mode=None)
-        env = Monitor(env, log_dir, info_keywords=())
+        env = gym.make("ZombieSurvival-v0")
+        env = Monitor(env, os.path.join(log_dir, f"env_{rank}"))
         return env
     return _init
+
 
 def get_run_dir():
     """Create a unique run directory with timestamp."""
     base_dir = "models"
     os.makedirs(base_dir, exist_ok=True)
     
-    # Use timestamp: YYYYMMDD_HHMMSS
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(base_dir, f"run_{timestamp}")
+    run_dir = os.path.join(base_dir, f"zombie_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
     
     return run_dir
 
-def train():
-    print("Setting up Worms3D environment for training...")
+
+def train(n_envs=8, total_timesteps=5_000_000, resume_from=None):
+    print("Setting up Zombie Survival environment for training...")
     
     # Create run directory
     run_dir = get_run_dir()
@@ -43,47 +43,73 @@ def train():
     os.makedirs(log_dir, exist_ok=True)
     
     print(f"Run directory: {run_dir}")
+    print(f"Using {n_envs} parallel environments")
     
-    # Initialize parallel environments with Monitor wrapper for episode stats
-    env = SubprocVecEnv([make_env(log_dir, i) for i in range(N_ENVS)])
-    env = VecFrameStack(env, n_stack=4)  # Stack last 4 observations
+    # Create vectorized environment with multiple workers
+    env = SubprocVecEnv([make_env(log_dir, i) for i in range(n_envs)])
+    env = VecFrameStack(env, n_stack=8)
     
-    print(f"Running {N_ENVS} parallel environments")
     print(f"Action Space: {env.action_space}")
     print(f"Observation Space: {env.observation_space}")
     
-    # Initialize PPO Agent
-    # n_steps is per environment, so total batch = n_steps * N_ENVS
-    model = PPO(
-        "MlpPolicy", 
-        env, 
-        verbose=1,
-        tensorboard_log=log_dir,
-        learning_rate=3e-4,
-        n_steps=2048,  # Per env, so 2048 * 8 = 16384 total steps per update
-        batch_size=256,  # Larger batch for more parallel data
-        gamma=0.99,
-        gae_lambda=0.95,
-        ent_coef=0.2,  # High exploration to learn movement
+    # Larger network architecture
+    policy_kwargs = dict(
+        net_arch=dict(
+            pi=[256, 256, 128],  # Policy network
+            vf=[256, 256, 128],  # Value function network
+        )
     )
+    
+    # Initialize or load PPO Agent
+    if resume_from and os.path.exists(resume_from): 
+        print(f"Resuming from: {resume_from}")
+        model = PPO.load(resume_from, env=env, tensorboard_log=log_dir)
+    else:
+        model = PPO(
+            "MlpPolicy", 
+            env, 
+            verbose=1,
+            tensorboard_log=log_dir,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=256,
+            gamma=0.99,
+            gae_lambda=0.95,
+            ent_coef=0.1,  # Exploration
+            n_epochs=10,
+            clip_range=0.2,
+            device="auto",
+            policy_kwargs=policy_kwargs,
+        )
     
     # Checkpoint callback
     checkpoint_callback = CheckpointCallback(
-        save_freq=10000,
+        save_freq=50000 // n_envs,  # Save every ~50k total steps
         save_path=run_dir,
-        name_prefix='checkpoint'
+        name_prefix='zombie_checkpoint'
     )
     
-    print("Starting training...")
-    total_timesteps = 5_000_000
+    print(f"Starting training for {total_timesteps:,} timesteps...")
     model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
     
     print("Training finished.")
     
     # Save final model
-    final_path = os.path.join(run_dir, "final_model")
+    final_path = os.path.join(run_dir, "zombie_final")
     model.save(final_path)
     print(f"Model saved to {final_path}")
+    
+    env.close()
+
 
 if __name__ == "__main__":
-    train()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train zombie survival agent")
+    parser.add_argument("--envs", type=int, default=8, help="Number of parallel environments")
+    parser.add_argument("--steps", type=int, default=100_000_000, help="Total training timesteps")
+    parser.add_argument("--resume", type=str, default=None, help="Path to model to resume from")
+    
+    args = parser.parse_args()
+    
+    train(n_envs=args.envs, total_timesteps=args.steps, resume_from=args.resume)
