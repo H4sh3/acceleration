@@ -9,3 +9,8 @@ register(
     id="ZombieSurvival-v0",
     entry_point="worms_3d_gym.envs:ZombieSurvivalEnv",
 )
+
+register(
+    id="ZombieSurvivalCNN-v0",
+    entry_point="worms_3d_gym.envs:ZombieSurvivalCNNEnv",
+)

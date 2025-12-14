@@ -317,8 +317,8 @@ class ZombieRenderer:
         
         # Get latest frame from stacked observation
         obs = self.current_obs.flatten()
-        agent_obs_dim = 23  # New simplified observation
-        total_obs_dim = agent_obs_dim * 2  # 46 for zombie env (duplicated)
+        agent_obs_dim = 27  # 1 health + 2 zombies x 4 + 8 wall + 1 shots + 9 quadrants
+        total_obs_dim = agent_obs_dim * 2  # 54 for zombie env (duplicated)
         
         if len(obs) >= total_obs_dim * 4:
             # Get last frame from stacked obs
@@ -327,7 +327,7 @@ class ZombieRenderer:
         elif len(obs) >= total_obs_dim:
             obs = obs[:total_obs_dim]
         
-        # Use first 23 dims (player observation)
+        # Use first 27 dims (player observation)
         agent_obs = obs[:agent_obs_dim] if len(obs) >= agent_obs_dim else obs
         
         y_start = 10
@@ -344,32 +344,29 @@ class ZombieRenderer:
             ("health", agent_obs[0]),
         ])
         
-        # Closest zombie (1-4)
-        y = self._draw_obs_section(panel_x, y, "Closest Zombie", [
-            ("cos Δ", agent_obs[1]),
-            ("sin Δ", agent_obs[2]),
-            ("dist", agent_obs[3]),
-            ("LOS", agent_obs[4]),
-        ])
-        
-        # Ray sensors visualization (5-12 wall, 13-20 enemy)
-        wall_rays = agent_obs[5:13] if len(agent_obs) >= 13 else [0]*8
-        enemy_rays = agent_obs[13:21] if len(agent_obs) >= 21 else [0]*8
-        # Use cos/sin from zombie direction for heading indicator
-        cos_theta = agent_obs[1] if len(agent_obs) > 1 else 1.0
-        sin_theta = agent_obs[2] if len(agent_obs) > 2 else 0.0
-        y = self._draw_ray_viz(panel_x, y, wall_rays, cos_theta, sin_theta, enemy_rays)
-        
-        # Aim indicator (21)
-        if len(agent_obs) >= 22:
-            y = self._draw_obs_section(panel_x, y, "Aim", [
-                ("on_target", agent_obs[21]),
+        # 2 Zombies (indices 1-8, 4 per zombie: cos, sin, dist, in_range)
+        for i in range(2):
+            base_idx = 1 + i * 4
+            in_range = agent_obs[base_idx + 3] if len(agent_obs) > base_idx + 3 else 0
+            range_str = "YES" if in_range > 0.5 else "NO"
+            y = self._draw_obs_section(panel_x, y, f"Zombie {i+1} (range: {range_str})", [
+                ("cos Δ", agent_obs[base_idx]),
+                ("sin Δ", agent_obs[base_idx + 1]),
+                ("dist", agent_obs[base_idx + 2]),
+                ("in_range", agent_obs[base_idx + 3]),
             ])
         
-        # Shots remaining (22)
-        if len(agent_obs) >= 23:
+        # Ray sensors visualization (9-16 wall only)
+        wall_rays = agent_obs[9:17] if len(agent_obs) >= 17 else [0]*8
+        # Use cos/sin from closest zombie direction for heading indicator
+        cos_theta = agent_obs[1] if len(agent_obs) > 1 else 1.0
+        sin_theta = agent_obs[2] if len(agent_obs) > 2 else 0.0
+        y = self._draw_ray_viz(panel_x, y, wall_rays, cos_theta, sin_theta, None)
+        
+        # Shots remaining (17)
+        if len(agent_obs) >= 18:
             y = self._draw_obs_section(panel_x, y, "Status", [
-                ("shots_left", agent_obs[22]),
+                ("shots_left", agent_obs[17]),
             ])
     
     def _draw_obs_section(self, panel_x, y, title, items):
@@ -480,79 +477,42 @@ class ZombieRenderer:
 
 
 def run_zombie_renderer():
-    """Run the zombie environment with pygame rendering and trained model."""
+    """Run 5 zombie environments, pick the one with most kills, and render it."""
     import gymnasium as gym
     import worms_3d_gym
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
     
-    # Wrap env with frame stacking to match training setup
-    env = DummyVecEnv([lambda: gym.make("ZombieSurvival-v0")])
-    env = VecFrameStack(env, n_stack=4)
-    unwrapped = env.envs[0].unwrapped
-    
-    # Create renderer
-    renderer = ZombieRenderer(
-        map_width=unwrapped.SIZE,
-        map_depth=unwrapped.SIZE,
-        scale=20,
-        obstacles=unwrapped.OBSTACLES
-    )
-    
-    # Load newest model
+    # Load model once
     model = None
     model_path = MODEL_PATH
-    
     if os.path.exists(model_path):
         print(f"Loading model from {model_path}")
         model = PPO.load(model_path)
     
-    # Run simulation
-    obs = env.reset()
-    renderer.set_observation(obs)
-    renderer.record_state(
-        unwrapped.agent, 
-        unwrapped.zombies, 
-        unwrapped.last_shots, 
-        obs,
-        kills=unwrapped.kills
-    )
+    # Run 5 episodes and record each
+    num_runs = 50
+    all_histories = []
+    all_kills = []
     
-    print("Running zombie survival simulation...")
-    total_reward = 0
-    episode = 1
-    episode_steps = 0
+    print(f"Running {num_runs} simulations to find best episode...")
     
-    for step in range(1000):
-        if model:
-            action, _ = model.predict(obs, deterministic=True)
-        else:
-            action = env.action_space.sample()
+    for run_idx in range(num_runs):
+        # Create fresh env for each run
+        env = DummyVecEnv([lambda: gym.make("ZombieSurvival-v0")])
+        env = VecFrameStack(env, n_stack=8)
+        unwrapped = env.envs[0].unwrapped
         
-        action = action.flatten()
+        # Create renderer for recording (not displaying yet)
+        renderer = ZombieRenderer(
+            map_width=unwrapped.SIZE,
+            map_depth=unwrapped.SIZE,
+            scale=20,
+            obstacles=unwrapped.OBSTACLES
+        )
         
-        # Log action
-        action_names = ["nothing", "up", "down", "left", "right", "fine_rot_L", "fine_rot_R", "coarse_rot_L", "coarse_rot_R", "shoot", "dash"]
-        action_name = action_names[int(action[0])] if int(action[0]) < len(action_names) else f"action_{action[0]}"
-        
-        old_hp = unwrapped.agent["health"]
-        old_kills = unwrapped.kills
-        
-        obs, reward, done, info = env.step([action])
-        terminated = done[0]
-        
-        new_hp = unwrapped.agent["health"]
-        new_kills = unwrapped.kills
-        
-        # Log hits
-        if new_hp < old_hp:
-            print(f"  Step {step}: Player HIT! HP: {old_hp:.0f} -> {new_hp:.0f}")
-        if new_kills > old_kills:
-            print(f"  Step {step}: ZOMBIE KILLED! Total kills: {new_kills}")
-        
-        total_reward += reward[0]
-        episode_steps += 1
-        
+        # Run simulation
+        obs = env.reset()
         renderer.set_observation(obs)
         renderer.record_state(
             unwrapped.agent, 
@@ -562,17 +522,18 @@ def run_zombie_renderer():
             kills=unwrapped.kills
         )
         
-        # Log every 50 steps
-        if step % 50 == 0:
-            alive_zombies = sum(1 for z in unwrapped.zombies if z["alive"])
-            print(f"Step {step:3}: action={action_name:10} | HP: {new_hp:.0f} | Kills: {new_kills} | Zombies: {alive_zombies}")
-        
-        if terminated:
-            print(f"=== Episode {episode} ended at step {episode_steps}: GAME OVER! Kills: {unwrapped.kills}, Total reward: {total_reward:.1f} ===")
-            episode += 1
-            total_reward = 0
-            episode_steps = 0
-            obs = env.reset()
+        kills = 0
+        for step in range(1000):
+            if model:
+                action, _ = model.predict(obs, deterministic=True)
+            else:
+                action = env.action_space.sample()
+            
+            action = action.flatten()
+            
+            obs, reward, done, info = env.step([action])
+            terminated = done[0]
+            
             renderer.set_observation(obs)
             renderer.record_state(
                 unwrapped.agent, 
@@ -581,10 +542,42 @@ def run_zombie_renderer():
                 obs,
                 kills=unwrapped.kills
             )
+            
+            if terminated:
+                break
+                
+            kills = unwrapped.kills
+        
+        final_kills = kills
+        all_histories.append(renderer.history)
+        all_kills.append(final_kills)
+        
+        print(f"  Run {run_idx + 1}/{num_runs}: {final_kills} kills, {len(renderer.history)} frames")
+        env.close()
+    
+    # Find best run
+    best_idx = all_kills.index(max(all_kills))
+    best_kills = all_kills[best_idx]
+    best_history = all_histories[best_idx]
+    
+    print(f"\nBest run: #{best_idx + 1} with {best_kills} kills")
+    print(f"All kills: {all_kills}")
+    
+    # Create renderer for playback
+    env = DummyVecEnv([lambda: gym.make("ZombieSurvival-v0")])
+    unwrapped = env.envs[0].unwrapped
+    
+    renderer = ZombieRenderer(
+        map_width=unwrapped.SIZE,
+        map_depth=unwrapped.SIZE,
+        scale=20,
+        obstacles=unwrapped.OBSTACLES
+    )
+    renderer.history = best_history
     
     env.close()
     
-    print(f"Recorded {len(renderer.history)} frames. Playing back...")
+    print(f"Playing back best episode ({len(best_history)} frames)...")
     renderer.play_history(fps=10)
 
 

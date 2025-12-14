@@ -47,13 +47,21 @@ def train(n_envs=8, total_timesteps=5_000_000, resume_from=None):
     
     # Create vectorized environment with multiple workers
     env = SubprocVecEnv([make_env(log_dir, i) for i in range(n_envs)])
-    env = VecFrameStack(env, n_stack=4)
+    env = VecFrameStack(env, n_stack=8)
     
     print(f"Action Space: {env.action_space}")
     print(f"Observation Space: {env.observation_space}")
     
+    # Larger network architecture
+    policy_kwargs = dict(
+        net_arch=dict(
+            pi=[256, 256, 128],  # Policy network
+            vf=[256, 256, 128],  # Value function network
+        )
+    )
+    
     # Initialize or load PPO Agent
-    if resume_from and os.path.exists(resume_from):
+    if resume_from and os.path.exists(resume_from): 
         print(f"Resuming from: {resume_from}")
         model = PPO.load(resume_from, env=env, tensorboard_log=log_dir)
     else:
@@ -71,6 +79,7 @@ def train(n_envs=8, total_timesteps=5_000_000, resume_from=None):
             n_epochs=10,
             clip_range=0.2,
             device="auto",
+            policy_kwargs=policy_kwargs,
         )
     
     # Checkpoint callback
@@ -98,7 +107,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Train zombie survival agent")
     parser.add_argument("--envs", type=int, default=8, help="Number of parallel environments")
-    parser.add_argument("--steps", type=int, default=5_000_000, help="Total training timesteps")
+    parser.add_argument("--steps", type=int, default=100_000_000, help="Total training timesteps")
     parser.add_argument("--resume", type=str, default=None, help="Path to model to resume from")
     
     args = parser.parse_args()
