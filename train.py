@@ -8,14 +8,17 @@ import worms_3d_gym
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack
 from stable_baselines3.common.monitor import Monitor
 
-def make_env(log_dir):
+# Number of parallel environments
+N_ENVS = 8
+
+def make_env(log_dir, rank):
     """Create a monitored environment."""
     def _init():
         env = gym.make("Worms3D-v0", render_mode=None)
-        env = Monitor(env, log_dir)  # Wrap with Monitor to track ep_rew and ep_len
+        env = Monitor(env, log_dir, info_keywords=())
         return env
     return _init
 
@@ -41,22 +44,24 @@ def train():
     
     print(f"Run directory: {run_dir}")
     
-    # Initialize environment with Monitor wrapper for episode stats
-    env = DummyVecEnv([make_env(log_dir)])
+    # Initialize parallel environments with Monitor wrapper for episode stats
+    env = SubprocVecEnv([make_env(log_dir, i) for i in range(N_ENVS)])
     env = VecFrameStack(env, n_stack=4)  # Stack last 4 observations
     
+    print(f"Running {N_ENVS} parallel environments")
     print(f"Action Space: {env.action_space}")
     print(f"Observation Space: {env.observation_space}")
     
     # Initialize PPO Agent
+    # n_steps is per environment, so total batch = n_steps * N_ENVS
     model = PPO(
         "MlpPolicy", 
         env, 
         verbose=1,
         tensorboard_log=log_dir,
         learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64,
+        n_steps=2048,  # Per env, so 2048 * 8 = 16384 total steps per update
+        batch_size=256,  # Larger batch for more parallel data
         gamma=0.99,
         gae_lambda=0.95,
         ent_coef=0.2,  # High exploration to learn movement

@@ -92,7 +92,7 @@ class PygameRenderer:
         sy = int((self.map_depth - 1 - y) * self.scale)  # Flip Y axis
         return sx, sy
     
-    def record_state(self, agents, shots=None, obs=None):
+    def record_state(self, agents, shots=None, obs=None, ammo_pickup=None):
         """Record current state for replay."""
         agent_snapshot = []
         for a in agents:
@@ -101,31 +101,57 @@ class PygameRenderer:
                 "health": a["health"],
                 "team": a["team"],
                 "angle": a.get("angle", 0),
-                "alive": a["alive"]
+                "alive": a["alive"],
+                "ammo": a.get("ammo", 0)
             })
         
         shot_snapshot = []
         if shots:
             for s in shots:
-                shot_snapshot.append({
-                    "origin": s["origin"].copy(),
-                    "dx": s["dx"], "dy": s["dy"],
-                    "hit": s["hit"],
-                    "team": s["team"]
-                })
+                # Handle new projectile format (pos, vel) or legacy format (origin, dx, dy)
+                if "pos" in s:
+                    shot_snapshot.append({
+                        "pos": s["pos"].copy(),
+                        "vel": s["vel"].copy(),
+                        "owner": s.get("owner", 0),
+                        "active": s.get("active", True)
+                    })
+                else:
+                    shot_snapshot.append({
+                        "origin": s["origin"].copy(),
+                        "dx": s["dx"], "dy": s["dy"],
+                        "hit": s.get("hit", False),
+                        "team": s.get("team", 0)
+                    })
+        
+        # Record ammo pickup state
+        ammo_snapshot = None
+        if ammo_pickup is not None:
+            ammo_snapshot = {
+                "pos": ammo_pickup["pos"].copy(),
+                "active": ammo_pickup["active"]
+            }
         
         self.history.append({
             "agents": agent_snapshot, 
             "shots": shot_snapshot,
-            "obs": obs.copy() if obs is not None else None
+            "obs": obs.copy() if obs is not None else None,
+            "ammo_pickup": ammo_snapshot
         })
     
     def clear_history(self):
         """Clear recorded history."""
         self.history = []
     
-    def render_frame(self, agents, shots=None, step=None):
-        """Render a single frame."""
+    def render_frame(self, agents, shots=None, step=None, ammo_pickup=None):
+        """Render a single frame.
+        
+        Args:
+            agents: List of agent dicts
+            shots: List of projectile dicts
+            step: Current step number
+            ammo_pickup: Dict with 'pos' and 'active' keys, or None
+        """
         self.init()
         
         # Handle pygame events
@@ -150,24 +176,45 @@ class PygameRenderer:
             pygame.draw.rect(self.screen, (101, 67, 33), obstacle_rect)  # Dark brown fill
             pygame.draw.rect(self.screen, BLACK, obstacle_rect, 3)  # Black border
         
-        # Draw shots (laser beams)
+        # Draw ammo pickup (yellow/gold box)
+        if ammo_pickup and ammo_pickup.get("active", False):
+            px, py = self.world_to_screen(ammo_pickup["pos"][0], ammo_pickup["pos"][1])
+            pickup_radius = int(self.scale * 0.5)
+            pygame.draw.rect(self.screen, (255, 215, 0),  # Gold
+                           (px - pickup_radius, py - pickup_radius, pickup_radius * 2, pickup_radius * 2))
+            pygame.draw.rect(self.screen, BLACK,
+                           (px - pickup_radius, py - pickup_radius, pickup_radius * 2, pickup_radius * 2), 2)
+            # Draw "A" for ammo
+            ammo_label = self.font.render("A", True, BLACK)
+            self.screen.blit(ammo_label, (px - 5, py - 8))
+        
+        # Draw shots/projectiles
         if shots:
             for shot in shots:
-                ox, oy = self.world_to_screen(shot["origin"][0], shot["origin"][1])
-                # Extend line to edge of screen
-                dx, dy = shot["dx"], -shot["dy"]  # Flip dy for screen coords
-                end_x = ox + dx * self.screen_width
-                end_y = oy + dy * self.screen_height
-                
-                # Color based on team and hit
-                if shot["hit"]:
-                    color = (255, 255, 0)  # Yellow for hit
-                    width = 3
+                # Handle new projectile format (pos, vel)
+                if "pos" in shot:
+                    px, py = self.world_to_screen(shot["pos"][0], shot["pos"][1])
+                    owner = shot.get("owner", 0)
+                    color = TEAM_COLORS[owner % len(TEAM_COLORS)]
+                    pygame.draw.circle(self.screen, color, (px, py), 6)
+                    pygame.draw.circle(self.screen, (255, 255, 255), (px, py), 6, 2)
                 else:
-                    color = TEAM_COLORS[shot["team"]]
-                    width = 2
-                
-                pygame.draw.line(self.screen, color, (ox, oy), (int(end_x), int(end_y)), width)
+                    # Legacy hitscan format (origin, dx, dy)
+                    ox, oy = self.world_to_screen(shot["origin"][0], shot["origin"][1])
+                    # Extend line to edge of screen
+                    dx, dy = shot["dx"], -shot["dy"]  # Flip dy for screen coords
+                    end_x = ox + dx * self.screen_width
+                    end_y = oy + dy * self.screen_height
+                    
+                    # Color based on team and hit
+                    if shot.get("hit", False):
+                        color = (255, 255, 0)  # Yellow for hit
+                        width = 3
+                    else:
+                        color = TEAM_COLORS[shot.get("team", 0)]
+                        width = 2
+                    
+                    pygame.draw.line(self.screen, color, (ox, oy), (int(end_x), int(end_y)), width)
         
         # Draw agents
         for agent in agents:
@@ -235,10 +282,10 @@ class PygameRenderer:
                         (panel_x, 0), (panel_x, self.screen_height), 2)
         
         # Get latest frame from stacked observation
-        # Frame stacking: 4 frames x 56 dims = 224 total (28 per agent x 2 agents)
+        # Frame stacking: 4 frames x 74 dims = 296 total (37 per agent x 2 agents)
         obs = self.current_obs.flatten()
-        agent_obs_dim = 28  # Updated observation dimension per agent
-        total_obs_dim = agent_obs_dim * 2  # 56 for both agents
+        agent_obs_dim = 41  # Updated observation dimension per agent (29 base + 8 projectile rays + 4 ammo pickup)
+        total_obs_dim = agent_obs_dim * 2  # 74 for both agents
         
         if len(obs) >= total_obs_dim * 4:
             # Get last frame (most recent) from stacked obs
@@ -247,7 +294,7 @@ class PygameRenderer:
         elif len(obs) >= total_obs_dim:
             obs = obs[:total_obs_dim]
         
-        # Split into agent 0 and agent 1 observations (28 dims each)
+        # Split into agent 0 and agent 1 observations (29 dims each)
         obs0 = obs[:agent_obs_dim] if len(obs) >= agent_obs_dim else obs
         obs1 = obs[agent_obs_dim:agent_obs_dim*2] if len(obs) >= agent_obs_dim*2 else None
         
@@ -294,11 +341,21 @@ class PygameRenderer:
             enemy_rays = agent_obs[20:28] if len(agent_obs) >= 28 else [0]*8
             y = self._draw_ray_viz(col_x, y, agent_obs[10:18], agent_obs[0], agent_obs[1], enemy_rays)
             
+            # Projectile ray sensors (29-36) - draw as second radar
+            proj_rays = agent_obs[29:37] if len(agent_obs) >= 37 else [1.0]*8
+            y = self._draw_projectile_ray_viz(col_x, y, proj_rays, agent_obs[0], agent_obs[1])
+            
             # Step feedback (18-19)
             y = self._draw_obs_section(col_x, y, "Feedback", [
                 ("was_hit", agent_obs[18]),
                 ("hit_enemy", agent_obs[19]),
             ])
+            
+            # Aim indicator (28)
+            if len(agent_obs) >= 29:
+                y = self._draw_obs_section(col_x, y, "Aim", [
+                    ("on_target", agent_obs[28]),
+                ])
     
     def _draw_obs_section(self, panel_x, y, title, items):
         """Draw a section of observation values."""
@@ -406,6 +463,72 @@ class PygameRenderer:
         
         return y + 75
     
+    def _draw_projectile_ray_viz(self, panel_x, y, proj_rays, cos_theta, sin_theta):
+        """Draw projectile ray sensor visualization as a mini radar.
+        
+        Args:
+            proj_rays: Normalized distance to nearest enemy projectile per ray (1.0 = none/far)
+        """
+        # Section title
+        text = self.small_font.render("Projectile Rays", True, (180, 180, 180))
+        self.screen.blit(text, (panel_x + 15, y))
+        y += 18
+        
+        # Draw mini radar
+        center_x = panel_x + 60
+        center_y = y + 35
+        radius = 30
+        
+        # Background circle
+        pygame.draw.circle(self.screen, (60, 60, 70), (center_x, center_y), radius)
+        pygame.draw.circle(self.screen, (100, 100, 110), (center_x, center_y), radius, 1)
+        
+        # Draw rays - 8 rays covering ±90° from heading
+        n_rays = len(proj_rays)
+        for i, proj_dist in enumerate(proj_rays):
+            # Ray angle relative to heading: from -90° to +90°
+            rel_angle = -math.pi/2 + (i / (n_rays - 1)) * math.pi
+            
+            # Convert to world angle using agent's heading
+            world_angle = math.atan2(sin_theta, cos_theta) + rel_angle
+            
+            # Ray endpoint (inverted for screen coords)
+            ray_len = radius * proj_dist
+            end_x = center_x + math.cos(world_angle) * ray_len
+            end_y = center_y - math.sin(world_angle) * ray_len
+            
+            # Color: Orange/red gradient based on proximity (closer = more red/danger)
+            # proj_dist near 0 = very close projectile (danger!)
+            # proj_dist near 1 = no projectile or far away
+            if proj_dist < 0.99:  # Projectile detected
+                danger = 1.0 - proj_dist  # Higher = closer = more danger
+                r = 255
+                g = int(150 * proj_dist)  # Less green when closer
+                b = 0
+                color = (r, g, b)
+                line_width = 3
+                dot_size = 5
+            else:
+                # No projectile - dim gray
+                color = (80, 80, 90)
+                line_width = 1
+                dot_size = 2
+            
+            pygame.draw.line(self.screen, color, (center_x, center_y), 
+                           (int(end_x), int(end_y)), line_width)
+            
+            # Draw endpoint dot
+            pygame.draw.circle(self.screen, color, (int(end_x), int(end_y)), dot_size)
+        
+        # Draw agent heading indicator
+        head_len = radius + 5
+        head_x = center_x + cos_theta * head_len
+        head_y = center_y - sin_theta * head_len
+        pygame.draw.line(self.screen, (255, 255, 255), (center_x, center_y),
+                        (int(head_x), int(head_y)), 2)
+        
+        return y + 75
+    
     def play_history(self, fps=10):
         """
         Play back recorded history.
@@ -452,7 +575,7 @@ class PygameRenderer:
 
 
 def run_with_pygame_renderer():
-    """Run the environment with pygame rendering."""
+    """Run the environment with pygame rendering. Plays back each episode then starts a new one."""
     import gymnasium as gym
     import worms_3d_gym
     import os
@@ -480,83 +603,133 @@ def run_with_pygame_renderer():
         print(f"Loading model from {model_path}")
         model = PPO.load(model_path)
     
-    # Run simulation
-    obs = env.reset()
-    renderer.set_observation(obs)
-    renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs)
+    episode = 0
+    running = True
+    wins = {"T0": 0, "T1": 0, "Draw": 0}
     
-    print("Running simulation...")
-    total_reward = 0
-    episode = 1
-    episode_steps = 0
-    hits = 0
-    
-    for step in range(200):
-        if model:
-            actions, _ = model.predict(obs, deterministic=True)
-        else:
-            actions = env.action_space.sample()
+    while running:
+        episode += 1
+        renderer.clear_history()
         
-        # actions is shape (1, 2) from vectorized env - flatten it
-        actions = actions.flatten()
-        
-        # Log actions
-        action_names = ["nothing", "up", "down", "left", "right", "rot_left", "rot_right", "shoot"]
-        a0_name = action_names[int(actions[0])]
-        a1_name = action_names[int(actions[1])]
-        
-        old_hp = [a["health"] for a in unwrapped.agents]
-        
-        obs, reward, done, info = env.step([actions])
-        terminated = done[0]
-        truncated = False
-        
-        new_hp = [a["health"] for a in unwrapped.agents]
-        
-        # Check for hits
-        for i in range(2):
-            if new_hp[i] < old_hp[i]:
-                hits += 1
-                print(f"  Step {step}: Agent {1-i} HIT Agent {i}! HP: {old_hp[i]:.0f} -> {new_hp[i]:.0f}")
-        
-        total_reward += reward[0]  # Extract scalar from vectorized env
-        episode_steps += 1
-        
+        # Reset environment
+        obs = env.reset()
         renderer.set_observation(obs)
-        renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs)
+        ammo_pickup = {"pos": unwrapped.ammo_pickup_pos, "active": unwrapped.ammo_pickup_active}
+        renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs, ammo_pickup)
         
-        # Log every step
-        a0 = unwrapped.agents[0]
-        a1 = unwrapped.agents[1]
-        # obs is now (1, 160) with frame stacking - 40 dims per frame, 4 frames
-        # Latest frame starts at index 120 (3 * 40)
-        # Agent 0: indices 0-19, Agent 1: indices 20-39 within each frame
-        # cos_delta_enemy at index 6, has_los at index 9
-        flat_obs = obs[0]
-        latest_frame_start = 3 * 40  # Last of 4 stacked frames
-        a0_cos_delta = flat_obs[latest_frame_start + 6]
-        a0_has_los = flat_obs[latest_frame_start + 9]
-        a1_cos_delta = flat_obs[latest_frame_start + 20 + 6]
-        a1_has_los = flat_obs[latest_frame_start + 20 + 9]
-        aim0 = "AIM!" if (a0_cos_delta > 0.9 and a0_has_los > 0.5) else "    "
-        aim1 = "AIM!" if (a1_cos_delta > 0.9 and a1_has_los > 0.5) else "    "
-        print(f"Step {step:3}: A0={a0_name:10} {aim0} | A1={a1_name:10} {aim1} | HP: {new_hp[0]:.0f} vs {new_hp[1]:.0f}")
+        print(f"\n=== Starting Episode {episode} ===")
+        total_reward = 0
+        hits = 0
         
-        if terminated or truncated:
-            winner = "T0" if unwrapped.agents[0]["alive"] else "T1" if unwrapped.agents[1]["alive"] else "Draw"
-            print(f"=== Episode {episode} ended at step {episode_steps}: {winner} wins! Total reward: {total_reward:.1f}, Hits: {hits} ===")
-            episode += 1
-            total_reward = 0
-            episode_steps = 0
-            hits = 0
-            obs = env.reset()
+        # Run up to 200 steps
+        for step in range(200):
+            if model:
+                actions, _ = model.predict(obs, deterministic=True)
+            else:
+                actions = env.action_space.sample()
+            
+            actions = actions.flatten()
+            
+            action_names = ["nothing", "up", "down", "left", "right", "rot_left", "rot_right", "shoot", "dash"]
+            a0_name = action_names[int(actions[0])]
+            a1_name = action_names[int(actions[1])]
+            
+            old_hp = [a["health"] for a in unwrapped.agents]
+            
+            obs, reward, done, info = env.step([actions])
+            terminated = done[0]
+            
+            new_hp = [a["health"] for a in unwrapped.agents]
+            
+            # Check for hits
+            for i in range(2):
+                if new_hp[i] < old_hp[i]:
+                    hits += 1
+                    print(f"  Step {step}: Agent {1-i} HIT Agent {i}! HP: {old_hp[i]:.0f} -> {new_hp[i]:.0f}")
+            
+            total_reward += reward[0]
+            
             renderer.set_observation(obs)
-            renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs)
-
-    env.close()
+            ammo_pickup = {"pos": unwrapped.ammo_pickup_pos, "active": unwrapped.ammo_pickup_active}
+            renderer.record_state(unwrapped.agents, unwrapped.last_shots, obs, ammo_pickup)
+            
+            # Log step
+            flat_obs = obs[0]
+            agent_obs_dim = 41
+            total_obs_dim = agent_obs_dim * 2
+            latest_frame_start = 3 * total_obs_dim
+            a0_cos_delta = flat_obs[latest_frame_start + 6]
+            a0_has_los = flat_obs[latest_frame_start + 9]
+            a1_cos_delta = flat_obs[latest_frame_start + agent_obs_dim + 6]
+            a1_has_los = flat_obs[latest_frame_start + agent_obs_dim + 9]
+            aim0 = "AIM!" if (a0_cos_delta > 0.9 and a0_has_los > 0.5) else "    "
+            aim1 = "AIM!" if (a1_cos_delta > 0.9 and a1_has_los > 0.5) else "    "
+            ammo0 = unwrapped.agents[0]["ammo"]
+            ammo1 = unwrapped.agents[1]["ammo"]
+            print(f"Step {step:3}: A0={a0_name:10} {aim0} | A1={a1_name:10} {aim1} | HP: {new_hp[0]:.0f} vs {new_hp[1]:.0f} | Ammo: {ammo0} vs {ammo1}")
+            
+            if terminated:
+                break
+        
+        # Episode finished
+        winner = "T0" if unwrapped.agents[0]["alive"] else "T1" if unwrapped.agents[1]["alive"] else "Draw"
+        wins[winner] += 1
+        total_games = wins["T0"] + wins["T1"] + wins["Draw"]
+        print(f"=== Episode {episode} ended at step {step+1}: {winner} wins! Reward: {total_reward:.1f}, Hits: {hits} ===")
+        print(f"    Win stats: T0={wins['T0']} ({100*wins['T0']/total_games:.1f}%) | T1={wins['T1']} ({100*wins['T1']/total_games:.1f}%) | Draw={wins['Draw']} ({100*wins['Draw']/total_games:.1f}%)")
+        
+        # Play back the episode
+        print(f"Playing back {len(renderer.history)} frames...")
+        renderer.init()
+        
+        for i, state in enumerate(renderer.history):
+            # Check for quit during playback
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    break
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    running = False
+                    break
+            
+            if not running:
+                break
+            
+            if state.get("obs") is not None:
+                renderer.current_obs = state["obs"]
+            renderer.render_frame(state["agents"], shots=state.get("shots", []), step=i, 
+                                 ammo_pickup=state.get("ammo_pickup"))
+            renderer.clock.tick(15)
+        
+        if not running:
+            break
+        
+        # Brief pause before next episode
+        print("Starting next episode in 2 seconds... (ESC to quit)")
+        pause_start = time.time()
+        while time.time() - pause_start < 2.0:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    break
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    running = False
+                    break
+            if not running:
+                break
     
-    print(f"Recorded {len(renderer.history)} frames. Playing back...")
-    renderer.play_history(fps=5)
+    env.close()
+    pygame.quit()
+    
+    # Final stats
+    total_games = wins["T0"] + wins["T1"] + wins["Draw"]
+    if total_games > 0:
+        print(f"\n{'='*50}")
+        print(f"FINAL STATS after {total_games} episodes:")
+        print(f"  T0 (Red):  {wins['T0']:3} wins ({100*wins['T0']/total_games:.1f}%)")
+        print(f"  T1 (Blue): {wins['T1']:3} wins ({100*wins['T1']/total_games:.1f}%)")
+        print(f"  Draws:     {wins['Draw']:3}      ({100*wins['Draw']/total_games:.1f}%)")
+        print(f"{'='*50}")
 
 
 if __name__ == "__main__":

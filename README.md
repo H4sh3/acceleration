@@ -133,3 +133,56 @@ RAY_MAX_RANGE = 30.0         # Ray sensor range
 N_RAYS = 8                   # Number of ray sensors
 HIT_THRESHOLD = 1.5          # Beam width for hits
 ```
+
+## Titans Memory Architecture
+
+This project includes an implementation of Google's **Titans** architecture for long-term memory in RL agents.
+
+### What is Titans?
+
+Titans introduces a novel approach to sequence modeling that combines:
+- **Deep Neural Memory**: Uses an MLP as memory (not a fixed-size vector like RNNs)
+- **Surprise-Based Memorization**: Gradient magnitude determines what's worth remembering
+- **Momentum**: Considers recent context flow, not just current input
+- **Adaptive Forgetting**: Weight decay mechanism to discard stale information
+
+### Training with Titans Memory
+
+```bash
+# Default Titans architecture
+python train_zombie_titans.py --variant titans
+
+# YAAD variant (robust to outliers)
+python train_zombie_titans.py --variant yaad
+
+# MONETA variant (stricter penalties)
+python train_zombie_titans.py --variant moneta
+
+# MEMORA variant (probability-constrained)
+python train_zombie_titans.py --variant memora
+
+# Customize memory depth (deeper = more expressive)
+python train_zombie_titans.py --variant titans --depth 4 --features 256
+```
+
+### Memory Variants
+
+| Variant | Description | Best For |
+|---------|-------------|----------|
+| **titans** | Default deep memory with surprise gating | General use |
+| **yaad** | Huber loss for outlier robustness | Noisy/inconsistent data |
+| **moneta** | Generalized p-norms for stricter learning | Stable, disciplined memory |
+| **memora** | Softmax-normalized probability updates | Controlled, balanced updates |
+
+### Key Benefits for RL
+
+1. **Temporal Context**: Agent remembers important events across timesteps
+2. **Selective Memory**: Only surprising/important events are memorized
+3. **Scalability**: Deep memory handles longer episodes without degradation
+4. **Adaptability**: Forgetting mechanism prevents stale information buildup
+
+### Reference
+
+- [Titans + MIRAS Blog Post](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/)
+- [Titans Paper](https://arxiv.org/abs/2501.00663)
+- [MIRAS Paper](https://arxiv.org/abs/2501.00662)
