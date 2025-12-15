@@ -85,6 +85,9 @@ class ZombieRenderer:
         # Current agent position for camera
         self.agent_pos = np.array([0.0, 0.0])
         
+        # Skill info for HUD
+        self.skill_info = None
+        
         # State history for replay
         self.history = []
         
@@ -111,7 +114,15 @@ class ZombieRenderer:
         sy = int(self.game_height / 2 - rel_y * self.scale)  # Flip Y axis
         return sx, sy
     
-    def record_state(self, agent, zombies, shots=None, obs=None, kills=0):
+    def set_skill_info(self, skill_points, move_speed_level, damage_level):
+        """Set skill info for HUD display."""
+        self.skill_info = {
+            'points': skill_points,
+            'speed': move_speed_level,
+            'damage': damage_level
+        }
+    
+    def record_state(self, agent, zombies, shots=None, obs=None, kills=0, skill_info=None):
         """Record current state for replay."""
         agent_snapshot = {
             "pos": agent["pos"].copy(),
@@ -151,7 +162,8 @@ class ZombieRenderer:
             "zombies": zombie_snapshot,
             "shots": shot_snapshot,
             "obs": obs.copy() if obs is not None else None,
-            "kills": kills
+            "kills": kills,
+            "skill_info": skill_info.copy() if skill_info else None
         })
     
     def clear_history(self):
@@ -309,6 +321,11 @@ class ZombieRenderer:
         pos_text = self.font.render(f"Pos: ({int(agent['pos'][0])}, {int(agent['pos'][1])})", True, BLACK)
         self.screen.blit(pos_text, (10, 90))
         
+        # Skill info (if available from env)
+        if hasattr(self, 'skill_info') and self.skill_info:
+            skill_text = self.font.render(f"SP: {self.skill_info['points']} | Spd: {self.skill_info['speed']} | Dmg: {self.skill_info['damage']}", True, BLACK)
+            self.screen.blit(skill_text, (10, 110))
+        
         # Draw observation panel
         if self.show_obs and self.current_obs is not None:
             self._render_obs_panel()
@@ -330,8 +347,8 @@ class ZombieRenderer:
         
         # Get latest frame from stacked observation
         obs = self.current_obs.flatten()
-        agent_obs_dim = 14  # 1 health + 2 zombies x 4 + 1 shots + 4 move toggles
-        total_obs_dim = agent_obs_dim * 2  # 28 for zombie env (duplicated)
+        agent_obs_dim = 18  # 1 health + 2 zombies x 4 + 1 shots + 4 move toggles + 4 skill
+        total_obs_dim = agent_obs_dim * 2  # 36 for zombie env (duplicated)
         
         if len(obs) >= total_obs_dim * 4:
             # Get last frame from stacked obs
@@ -378,10 +395,20 @@ class ZombieRenderer:
         # Movement toggles (10-13)
         if len(agent_obs) >= 14:
             y = self._draw_obs_section(panel_x, y, "Movement", [
-                ("up", agent_obs[10]),
-                ("down", agent_obs[11]),
-                ("left", agent_obs[12]),
-                ("right", agent_obs[13]),
+                ("forward", agent_obs[10]),
+                ("backward", agent_obs[11]),
+                ("strafe_L", agent_obs[12]),
+                ("strafe_R", agent_obs[13]),
+            ])
+        
+        # Skill system (14-17)
+        if len(agent_obs) >= 18:
+            can_skill = "YES" if agent_obs[14] > 0.5 else "NO"
+            y = self._draw_obs_section(panel_x, y, f"Skills (can skill: {can_skill})", [
+                ("can_skill", agent_obs[14]),
+                ("move_spd", agent_obs[15]),
+                ("damage", agent_obs[16]),
+                ("total", agent_obs[17]),
             ])
     
     def _draw_obs_section(self, panel_x, y, title, items):
@@ -467,6 +494,8 @@ class ZombieRenderer:
         for i, state in enumerate(self.history):
             if state.get("obs") is not None:
                 self.current_obs = state["obs"]
+            if state.get("skill_info") is not None:
+                self.skill_info = state["skill_info"]
             if not self.render_frame(
                 state["agent"], 
                 state["zombies"], 
@@ -528,12 +557,15 @@ def run_zombie_renderer():
         # Run simulation
         obs = env.reset()
         renderer.set_observation(obs)
+        skill_info = {'points': unwrapped.skill_points, 'speed': unwrapped.move_speed_level, 'damage': unwrapped.damage_level}
+        renderer.set_skill_info(unwrapped.skill_points, unwrapped.move_speed_level, unwrapped.damage_level)
         renderer.record_state(
             unwrapped.agent, 
             unwrapped.zombies, 
             unwrapped.projectiles, 
             obs,
-            kills=unwrapped.kills
+            kills=unwrapped.kills,
+            skill_info=skill_info
         )
         
         kills = 0
@@ -547,12 +579,15 @@ def run_zombie_renderer():
             terminated = done[0]
             
             renderer.set_observation(obs)
+            skill_info = {'points': unwrapped.skill_points, 'speed': unwrapped.move_speed_level, 'damage': unwrapped.damage_level}
+            renderer.set_skill_info(unwrapped.skill_points, unwrapped.move_speed_level, unwrapped.damage_level)
             renderer.record_state(
                 unwrapped.agent, 
                 unwrapped.zombies, 
                 unwrapped.projectiles, 
                 obs,
-                kills=unwrapped.kills
+                kills=unwrapped.kills,
+                skill_info=skill_info
             )
             
             if terminated:
