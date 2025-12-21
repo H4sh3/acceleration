@@ -18,14 +18,22 @@ DASH_DISTANCE = 5.0
 N_RAYS = 8
 RAY_MAX_RANGE = 10.0
 
-ZOMBIE_SPEED = 0.15
+ZOMBIE_BASE_SPEED = 0.15
+ZOMBIE_MAX_SPEED = 0.4
 ZOMBIE_BASE_HEALTH = 50
 ZOMBIE_HEALTH_SCALE = 1.5  # Multiplier per kill
-ZOMBIE_MAX_HEALTH = 1000  # Cap for zombie health
+ZOMBIE_MAX_HEALTH = 100  # Cap for zombie health
 ZOMBIE_DAMAGE = 10
-ZOMBIE_ATTACK_RANGE = 1.5
+ZOMBIE_ATTACK_RANGE = 2.5
 
-MOVE_STEP = 0.3
+# Acceleration system - 8 directions (45° apart)
+N_DIRECTIONS = 8  # 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°
+ACCEL_RATE = 0.02  # Speed increase per step when moving same direction
+DECEL_RATE = 0.05  # Speed decrease per step when changing direction
+ACCEL_STEPS_TO_MAX = 30  # Steps of consistent movement to reach max speed
+
+MOVE_BASE_SPEED = 0.2
+MOVE_MAX_SPEED = 0.6
 PROJECTILE_SPEED = 0.8
 PROJECTILE_DAMAGE = 25
 PROJECTILE_RADIUS = 0.5
@@ -33,15 +41,18 @@ PROJECTILE_MIN_HIT_DIST = 0.5
 PROJECTILE_MAX_RANGE = 7.0
 MAX_PROJECTILES = 10
 
-# Observation: 1 health + 2 zombies x 4 + 1 shots + 4 move toggles + 1 can_skill + 1 move_speed_level + 1 damage_level + 1 total_skilled = 18
-OBS_DIM = 18
-
-# Skill system
-MAX_SKILL_LEVEL = 10  # Max level per skill
+# Observation: 1 health + 5 zombies x 4 + 1 shots + 4 move toggles = 26
+OBS_DIM = 26
 
 # Spawn distance for zombies (relative to agent) - just outside aiming range
 ZOMBIE_SPAWN_DIST_MIN = 8.0   # Just outside PROJECTILE_MAX_RANGE (7.0)
 ZOMBIE_SPAWN_DIST_MAX = 12.0
+
+# Range at which zombies start chasing the agent
+ZOMBIE_CHASE_RANGE = 15.0
+
+# Max zombies that can spawn
+MAX_ZOMBIES = 5
 
 
 # =============================================================================
@@ -90,20 +101,18 @@ def ray_cast(x, y, angle, max_range, arena_size, obstacles):
 # Observation
 # =============================================================================
 def compute_observation(agent_pos, agent_angle, agent_health,
-                        zombie_positions, num_active_projectiles, move_toggles=None,
-                        skill_points=0, move_speed_level=0, damage_level=0):
-    """Compute 18-dim observation for infinite world.
+                        zombie_positions, num_active_projectiles, move_toggles=None):
+    """Compute 26-dim observation for infinite world.
     
     Indices:
         0: Health (normalized 0-1)
         1-4: Zombie 1 (closest): cos_delta, sin_delta, dist_normalized, in_range
-        5-8: Zombie 2 (next closest): cos_delta, sin_delta, dist_normalized, in_range
-        9: Shots remaining (normalized 0-1)
-        10-13: Movement toggles (forward, backward, strafe left, strafe right)
-        14: Can skill (1.0 if skill_points > 0, else 0.0)
-        15: Move speed level (normalized 0-1, max 10)
-        16: Damage level (normalized 0-1, max 10)
-        17: Total skilled (normalized 0-1, total points spent / max possible)
+        5-8: Zombie 2: cos_delta, sin_delta, dist_normalized, in_range
+        9-12: Zombie 3: cos_delta, sin_delta, dist_normalized, in_range
+        13-16: Zombie 4: cos_delta, sin_delta, dist_normalized, in_range
+        17-20: Zombie 5: cos_delta, sin_delta, dist_normalized, in_range
+        21: Shots remaining (normalized 0-1)
+        22-25: Movement toggles (forward, backward, strafe left, strafe right)
     """
     if move_toggles is None:
         move_toggles = [False, False, False, False]
@@ -116,8 +125,8 @@ def compute_observation(agent_pos, agent_angle, agent_health,
     # Health
     obs[0] = np.clip(agent_health / MAX_HEALTH, 0.0, 1.0)
     
-    # 2 closest zombies (relative to agent)
-    for i, zombie_pos in enumerate(zombie_positions[:2]):
+    # 5 closest zombies (relative to agent)
+    for i, zombie_pos in enumerate(zombie_positions[:5]):
         base_idx = 1 + i * 4
         if zombie_pos is not None:
             dx = zombie_pos[0] - x_self
@@ -141,17 +150,11 @@ def compute_observation(agent_pos, agent_angle, agent_health,
             obs[base_idx + 3] = 0.0
     
     # Shots remaining
-    obs[9] = (MAX_PROJECTILES - num_active_projectiles) / MAX_PROJECTILES
+    obs[21] = (MAX_PROJECTILES - num_active_projectiles) / MAX_PROJECTILES
     
     # Movement toggles
     for i, active in enumerate(move_toggles):
-        obs[10 + i] = 1.0 if active else 0.0
-    
-    # Skill system
-    obs[14] = 1.0 if skill_points > 0 else 0.0  # Can skill
-    obs[15] = move_speed_level / MAX_SKILL_LEVEL  # Move speed level (max 10)
-    obs[16] = damage_level / MAX_SKILL_LEVEL  # Damage level (max 10)
-    obs[17] = (move_speed_level + damage_level) / (2 * MAX_SKILL_LEVEL)  # Total skilled (0-1)
+        obs[22 + i] = 1.0 if active else 0.0
     
     return obs
 
@@ -172,9 +175,8 @@ class ZombieSurvivalEnv(gym.Env):
     # 8-9: less fine rotate (±5°) 
     # 10-11: coarse rotate (±45°)
     # 12: shoot
-    # 13: skill movement speed
-    # 14: skill damage
-    N_ACTIONS = 15
+    # 13: rotate 180°
+    N_ACTIONS = 14
     
     def __init__(self, render_mode=None):
         super().__init__()
@@ -183,18 +185,15 @@ class ZombieSurvivalEnv(gym.Env):
         
         # Discrete action space
         self.action_space = spaces.Discrete(self.N_ACTIONS)
+        # Observation space
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(OBS_DIM * 2,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
         )
         
         self.zombies = []
         self.kills = 0
         # Movement toggles: [forward, backward, strafe left, strafe right]
         self.move_toggles = [False, False, False, False]
-        # Skill system
-        self.skill_points = 0
-        self.move_speed_level = 0
-        self.damage_level = 0
     
     def _random_spawn_pos(self):
         """Get a random spawn position - agent starts at origin."""
@@ -211,7 +210,10 @@ class ZombieSurvivalEnv(gym.Env):
             "alive": True,
             "ammo": MAX_AMMO,
             "cooldown": 0,
-            "dash_cooldown": 0
+            "dash_cooldown": 0,
+            "velocity": 0.0,  # Current speed (scalar)
+            "move_dir": -1,   # Current movement direction index (0-7, -1 = none)
+            "accel_steps": 0  # Steps moving in same direction
         }
         
         self.agents = [self.agent]  # For renderer compatibility
@@ -224,12 +226,10 @@ class ZombieSurvivalEnv(gym.Env):
         self.projectiles = []
         self.spawn_edge_index = 0
         self.move_toggles = [False, False, False, False]
-        self.skill_points = 0
-        self.move_speed_level = 0
-        self.damage_level = 0
         self.zombie_health = ZOMBIE_BASE_HEALTH
+        self.min_zombies = 2  # Increases by 1 per kill
         
-        for _ in range(2):
+        for _ in range(self.min_zombies):
             self._spawn_zombie()
         
         return self._get_obs(), {}
@@ -237,12 +237,10 @@ class ZombieSurvivalEnv(gym.Env):
     def _spawn_zombie(self):
         """Spawn a zombie relative to agent position.
         
-        Spawns at a random angle, at distance between ZOMBIE_SPAWN_DIST_MIN and ZOMBIE_SPAWN_DIST_MAX.
+        Spawns at a random angle (full 360°), at distance between ZOMBIE_SPAWN_DIST_MIN and ZOMBIE_SPAWN_DIST_MAX.
         """
-        # Random angle with bias toward agent's facing direction (±45°)
-        agent_angle = self.agent["angle"]
-        offset = self.np_random.uniform(-math.pi / 4, math.pi / 4)
-        spawn_angle = agent_angle + offset
+        # Random angle - full 360° around the agent
+        spawn_angle = self.np_random.uniform(-math.pi, math.pi)
         
         # Random distance
         spawn_dist = self.np_random.uniform(ZOMBIE_SPAWN_DIST_MIN, ZOMBIE_SPAWN_DIST_MAX)
@@ -257,7 +255,10 @@ class ZombieSurvivalEnv(gym.Env):
             "pos": np.array([float(x), float(y)]),
             "health": self.zombie_health,
             "angle": 0.0,
-            "alive": True
+            "alive": True,
+            "velocity": 0.0,  # Current speed
+            "move_dir": -1,   # Current direction index
+            "accel_steps": 0  # Steps in same direction
         })
     
     def _get_zombies_sorted_by_distance(self):
@@ -315,32 +316,57 @@ class ZombieSurvivalEnv(gym.Env):
                     "active": True,
                     "distance_traveled": 0.0
                 })
-        elif action == 13:  # Skill movement speed
-            if self.skill_points > 0 and self.move_speed_level < MAX_SKILL_LEVEL:
-                self.skill_points -= 1
-                self.move_speed_level += 1
-        elif action == 14:  # Skill damage
-            if self.skill_points > 0 and self.damage_level < MAX_SKILL_LEVEL:
-                self.skill_points -= 1
-                self.damage_level += 1
+        elif action == 13:  # Rotate 180°
+            agent["angle"] += math.pi
         
         # Apply continuous movement from toggles (relative to agent facing)
-        # Movement speed scales with level: base + 20% per level
-        current_move_step = MOVE_STEP * (1.0 + 0.2 * self.move_speed_level)
+        # Determine movement direction from toggles
+        move_vec = np.array([0.0, 0.0])
         angle = agent["angle"]
         cos_a, sin_a = math.cos(angle), math.sin(angle)
+        
         if self.move_toggles[0]:  # Forward
-            agent["pos"][0] += cos_a * current_move_step
-            agent["pos"][1] += sin_a * current_move_step
+            move_vec[0] += cos_a
+            move_vec[1] += sin_a
         if self.move_toggles[1]:  # Backward
-            agent["pos"][0] -= cos_a * current_move_step
-            agent["pos"][1] -= sin_a * current_move_step
-        if self.move_toggles[2]:  # Strafe left (perpendicular, +90°)
-            agent["pos"][0] -= sin_a * current_move_step
-            agent["pos"][1] += cos_a * current_move_step
-        if self.move_toggles[3]:  # Strafe right (perpendicular, -90°)
-            agent["pos"][0] += sin_a * current_move_step
-            agent["pos"][1] -= cos_a * current_move_step
+            move_vec[0] -= cos_a
+            move_vec[1] -= sin_a
+        if self.move_toggles[2]:  # Strafe left
+            move_vec[0] -= sin_a
+            move_vec[1] += cos_a
+        if self.move_toggles[3]:  # Strafe right
+            move_vec[0] += sin_a
+            move_vec[1] -= cos_a
+        
+        # Calculate direction index (0-7) from movement vector
+        if np.linalg.norm(move_vec) > 0.01:
+            move_vec = move_vec / np.linalg.norm(move_vec)
+            move_angle = math.atan2(move_vec[1], move_vec[0])
+            # Snap to nearest 45° direction
+            new_dir = int(round((move_angle + math.pi) / (math.pi / 4))) % N_DIRECTIONS
+            
+            # Check if same direction as before
+            if new_dir == agent["move_dir"]:
+                agent["accel_steps"] += 1
+            else:
+                # Direction changed - reset acceleration
+                agent["accel_steps"] = 0
+                agent["move_dir"] = new_dir
+            
+            # Calculate speed based on acceleration
+            max_speed = MOVE_MAX_SPEED
+            base_speed = MOVE_BASE_SPEED
+            accel_progress = min(1.0, agent["accel_steps"] / ACCEL_STEPS_TO_MAX)
+            agent["velocity"] = base_speed + (max_speed - base_speed) * accel_progress
+            
+            # Apply movement
+            agent["pos"][0] += move_vec[0] * agent["velocity"]
+            agent["pos"][1] += move_vec[1] * agent["velocity"]
+        else:
+            # Not moving - decelerate
+            agent["velocity"] = max(0, agent["velocity"] - DECEL_RATE)
+            agent["accel_steps"] = 0
+            agent["move_dir"] = -1
         
         if agent["dash_cooldown"] > 0:
             agent["dash_cooldown"] -= 1
@@ -356,14 +382,34 @@ class ZombieSurvivalEnv(gym.Env):
             to_player = agent["pos"] - zombie["pos"]
             dist = np.linalg.norm(to_player)
             
-            # Only move toward player if within aiming range
-            if dist > 0.1 and dist <= PROJECTILE_MAX_RANGE:
+            # Only move toward player if within chase range
+            if dist > 0.1 and dist <= ZOMBIE_CHASE_RANGE:
                 direction = to_player / dist
-                zombie["pos"] = zombie["pos"] + direction * ZOMBIE_SPEED
-                zombie["angle"] = math.atan2(direction[1], direction[0])
+                move_angle = math.atan2(direction[1], direction[0])
+                
+                # Snap to nearest 45° direction
+                new_dir = int(round((move_angle + math.pi) / (math.pi / 4))) % N_DIRECTIONS
+                
+                # Check if same direction
+                if new_dir == zombie["move_dir"]:
+                    zombie["accel_steps"] += 1
+                else:
+                    zombie["accel_steps"] = 0
+                    zombie["move_dir"] = new_dir
+                
+                # Calculate zombie speed with acceleration
+                accel_progress = min(1.0, zombie["accel_steps"] / ACCEL_STEPS_TO_MAX)
+                zombie["velocity"] = ZOMBIE_BASE_SPEED + (ZOMBIE_MAX_SPEED - ZOMBIE_BASE_SPEED) * accel_progress
+                
+                zombie["pos"] = zombie["pos"] + direction * zombie["velocity"]
+                zombie["angle"] = move_angle
+            else:
+                # Not chasing - decelerate
+                zombie["velocity"] = max(0, zombie["velocity"] - DECEL_RATE)
+                zombie["accel_steps"] = 0
             
             if dist < ZOMBIE_ATTACK_RANGE:
-                agent["health"] -= ZOMBIE_DAMAGE * 0.1
+                agent["health"] -= ZOMBIE_DAMAGE
                 self.was_hit = 1.0
                 reward -= 1.0
             
@@ -375,8 +421,8 @@ class ZombieSurvivalEnv(gym.Env):
                 if dist > max_distance:
                     zombie["alive"] = False
         
-        # Maintain 2 zombies - spawn new ones relative to agent
-        while sum(1 for z in self.zombies if z["alive"]) < 2:
+        # Maintain min_zombies alive - spawn new ones relative to agent
+        while sum(1 for z in self.zombies if z["alive"]) < self.min_zombies:
             self._spawn_zombie()
         
         # Clean up dead zombies
@@ -430,18 +476,16 @@ class ZombieSurvivalEnv(gym.Env):
                     continue
                 
                 if np.linalg.norm(proj["pos"] - zombie["pos"]) < PROJECTILE_RADIUS + 0.5:
-                    # Damage scales with level: base + 20% per level
-                    current_damage = PROJECTILE_DAMAGE * (1.0 + 0.5 * self.damage_level)
-                    zombie["health"] -= current_damage
+                    zombie["health"] -= PROJECTILE_DAMAGE
                     self.hit_enemy = 1.0
-                    reward += current_damage
+                    reward += PROJECTILE_DAMAGE
                     proj["active"] = False
                     
                     if zombie["health"] <= 0:
                         zombie["alive"] = False
                         self.kills += 1
-                        self.skill_points += 1  # Award skill point on kill
                         self.zombie_health = min(self.zombie_health * ZOMBIE_HEALTH_SCALE, ZOMBIE_MAX_HEALTH)
+                        self.min_zombies = min(self.min_zombies + 1, MAX_ZOMBIES)  # Spawn one more zombie per kill, capped
                         reward += 100
                     break
             
@@ -457,16 +501,14 @@ class ZombieSurvivalEnv(gym.Env):
     
     def _get_obs(self):
         sorted_zombies = self._get_zombies_sorted_by_distance()
-        zombie_positions = [z["pos"] for z in sorted_zombies[:2]]
-        while len(zombie_positions) < 2:
+        zombie_positions = [z["pos"] for z in sorted_zombies[:5]]
+        while len(zombie_positions) < 5:
             zombie_positions.append(None)
         
-        obs = compute_observation(
+        return compute_observation(
             self.agent["pos"], self.agent["angle"], self.agent["health"],
-            zombie_positions, len(self.projectiles), self.move_toggles,
-            self.skill_points, self.move_speed_level, self.damage_level
+            zombie_positions, len(self.projectiles), self.move_toggles
         )
-        return np.concatenate([obs, obs])
     
     def render(self):
         pass

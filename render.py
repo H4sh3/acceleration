@@ -85,9 +85,6 @@ class ZombieRenderer:
         # Current agent position for camera
         self.agent_pos = np.array([0.0, 0.0])
         
-        # Skill info for HUD
-        self.skill_info = None
-        
         # State history for replay
         self.history = []
         
@@ -114,15 +111,7 @@ class ZombieRenderer:
         sy = int(self.game_height / 2 - rel_y * self.scale)  # Flip Y axis
         return sx, sy
     
-    def set_skill_info(self, skill_points, move_speed_level, damage_level):
-        """Set skill info for HUD display."""
-        self.skill_info = {
-            'points': skill_points,
-            'speed': move_speed_level,
-            'damage': damage_level
-        }
-    
-    def record_state(self, agent, zombies, shots=None, obs=None, kills=0, skill_info=None):
+    def record_state(self, agent, zombies, shots=None, obs=None, kills=0, herder=None, zombie_health=50):
         """Record current state for replay."""
         agent_snapshot = {
             "pos": agent["pos"].copy(),
@@ -157,13 +146,21 @@ class ZombieRenderer:
                         "hit": s.get("hit", False)
                     })
         
+        herder_snapshot = None
+        if herder is not None:
+            herder_snapshot = {
+                "pos": herder["pos"].copy(),
+                "in_position": herder.get("in_position", False)
+            }
+        
         self.history.append({
             "agent": agent_snapshot,
             "zombies": zombie_snapshot,
             "shots": shot_snapshot,
             "obs": obs.copy() if obs is not None else None,
             "kills": kills,
-            "skill_info": skill_info.copy() if skill_info else None
+            "herder": herder_snapshot,
+            "zombie_health": zombie_health
         })
     
     def clear_history(self):
@@ -224,7 +221,7 @@ class ZombieRenderer:
         health_color = (0, 255, 0) if health_pct > 0.5 else (255, 255, 0) if health_pct > 0.25 else (255, 0, 0)
         pygame.draw.rect(self.screen, health_color, (bar_x, bar_y, int(bar_width * health_pct), bar_height))
     
-    def _draw_zombie(self, zombie):
+    def _draw_zombie(self, zombie, zombie_health=50):
         """Draw a zombie."""
         if not zombie.get("alive", True):
             return
@@ -244,8 +241,9 @@ class ZombieRenderer:
         end_y = sy - math.sin(angle) * dir_len
         pygame.draw.line(self.screen, BLACK, (sx, sy), (int(end_x), int(end_y)), 2)
         
-        # Health bar
-        health_pct = zombie["health"] / 50.0  # ZOMBIE_HEALTH = 50
+        # Health bar - use zombie's own health or env's zombie_health
+        max_health = zombie.get("max_health", zombie_health)
+        health_pct = zombie["health"] / max_health if max_health > 0 else 1.0
         bar_width = self.scale * 0.8
         bar_height = 3
         bar_x = sx - bar_width // 2
@@ -271,7 +269,23 @@ class ZombieRenderer:
                 color = self.SHOT_COLOR_HIT if shot.get("hit") else self.PLAYER_COLOR
                 pygame.draw.line(self.screen, color, (ox, oy), (int(end_x), int(end_y)), 2)
     
-    def render_frame(self, agent, zombies, shots=None, step=None, kills=0):
+    def _draw_herder(self, herder):
+        """Draw the herder entity."""
+        pos = herder["pos"]
+        sx, sy = self.world_to_screen(pos[0], pos[1])
+        
+        # Herder body (circle) - cyan/green based on in_position
+        radius = int(self.scale * 0.5)
+        in_position = herder.get("in_position", False)
+        color = (0, 200, 0) if in_position else (0, 200, 200)  # Green if in position, cyan otherwise
+        pygame.draw.circle(self.screen, color, (sx, sy), radius)
+        pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), radius, 2)
+        
+        # Label
+        label = self.small_font.render("HERDER", True, (255, 255, 255))
+        self.screen.blit(label, (sx - label.get_width() // 2, sy + radius + 2))
+    
+    def render_frame(self, agent, zombies, shots=None, step=None, kills=0, herder=None, zombie_health=50):
         """Render a single frame."""
         self.init()
         
@@ -298,7 +312,11 @@ class ZombieRenderer:
         
         # Draw zombies
         for zombie in zombies:
-            self._draw_zombie(zombie)
+            self._draw_zombie(zombie, zombie_health=zombie_health)
+        
+        # Draw herder
+        if herder is not None:
+            self._draw_herder(herder)
         
         # Draw player
         self._draw_player(agent)
@@ -321,11 +339,6 @@ class ZombieRenderer:
         pos_text = self.font.render(f"Pos: ({int(agent['pos'][0])}, {int(agent['pos'][1])})", True, BLACK)
         self.screen.blit(pos_text, (10, 90))
         
-        # Skill info (if available from env)
-        if hasattr(self, 'skill_info') and self.skill_info:
-            skill_text = self.font.render(f"SP: {self.skill_info['points']} | Spd: {self.skill_info['speed']} | Dmg: {self.skill_info['damage']}", True, BLACK)
-            self.screen.blit(skill_text, (10, 110))
-        
         # Draw observation panel
         if self.show_obs and self.current_obs is not None:
             self._render_obs_panel()
@@ -347,17 +360,17 @@ class ZombieRenderer:
         
         # Get latest frame from stacked observation
         obs = self.current_obs.flatten()
-        agent_obs_dim = 18  # 1 health + 2 zombies x 4 + 1 shots + 4 move toggles + 4 skill
-        total_obs_dim = agent_obs_dim * 2  # 36 for zombie env (duplicated)
+        # OBS_DIM = 26: 1 health + 5 zombies x 4 + 1 shots + 4 move toggles
+        agent_obs_dim = 26
         
-        if len(obs) >= total_obs_dim * 4:
+        if len(obs) >= agent_obs_dim * 8:
             # Get last frame from stacked obs
-            latest_start = 3 * total_obs_dim
-            obs = obs[latest_start:latest_start + total_obs_dim]
-        elif len(obs) >= total_obs_dim:
-            obs = obs[:total_obs_dim]
+            latest_start = 7 * agent_obs_dim
+            obs = obs[latest_start:latest_start + agent_obs_dim]
+        elif len(obs) >= agent_obs_dim:
+            obs = obs[:agent_obs_dim]
         
-        # Use first 14 dims (player observation)
+        # Use first 26 dims (player observation)
         agent_obs = obs[:agent_obs_dim] if len(obs) >= agent_obs_dim else obs
         
         y_start = 10
@@ -374,41 +387,32 @@ class ZombieRenderer:
             ("health", agent_obs[0]),
         ])
         
-        # 2 Zombies (indices 1-8, 4 per zombie: cos, sin, dist, in_range)
-        for i in range(2):
+        # 5 Zombies (indices 1-20, 4 per zombie: cos, sin, dist, in_range)
+        for i in range(5):
             base_idx = 1 + i * 4
-            in_range = agent_obs[base_idx + 3] if len(agent_obs) > base_idx + 3 else 0
-            range_str = "YES" if in_range > 0.5 else "NO"
-            y = self._draw_obs_section(panel_x, y, f"Zombie {i+1} (range: {range_str})", [
-                ("cos Δ", agent_obs[base_idx]),
-                ("sin Δ", agent_obs[base_idx + 1]),
-                ("dist", agent_obs[base_idx + 2]),
-                ("in_range", agent_obs[base_idx + 3]),
-            ])
+            if len(agent_obs) > base_idx + 3:
+                in_range = agent_obs[base_idx + 3]
+                range_str = "YES" if in_range > 0.5 else "NO"
+                y = self._draw_obs_section(panel_x, y, f"Zombie {i+1} (range: {range_str})", [
+                    ("cos Δ", agent_obs[base_idx]),
+                    ("sin Δ", agent_obs[base_idx + 1]),
+                    ("dist", agent_obs[base_idx + 2]),
+                    ("in_range", agent_obs[base_idx + 3]),
+                ])
         
-        # Shots remaining (9)
-        if len(agent_obs) >= 10:
+        # Shots remaining (21)
+        if len(agent_obs) >= 22:
             y = self._draw_obs_section(panel_x, y, "Status", [
-                ("shots_left", agent_obs[9]),
+                ("shots_left", agent_obs[21]),
             ])
         
-        # Movement toggles (10-13)
-        if len(agent_obs) >= 14:
+        # Movement toggles (22-25)
+        if len(agent_obs) >= 26:
             y = self._draw_obs_section(panel_x, y, "Movement", [
-                ("forward", agent_obs[10]),
-                ("backward", agent_obs[11]),
-                ("strafe_L", agent_obs[12]),
-                ("strafe_R", agent_obs[13]),
-            ])
-        
-        # Skill system (14-17)
-        if len(agent_obs) >= 18:
-            can_skill = "YES" if agent_obs[14] > 0.5 else "NO"
-            y = self._draw_obs_section(panel_x, y, f"Skills (can skill: {can_skill})", [
-                ("can_skill", agent_obs[14]),
-                ("move_spd", agent_obs[15]),
-                ("damage", agent_obs[16]),
-                ("total", agent_obs[17]),
+                ("forward", agent_obs[22]),
+                ("backward", agent_obs[23]),
+                ("strafe_L", agent_obs[24]),
+                ("strafe_R", agent_obs[25]),
             ])
     
     def _draw_obs_section(self, panel_x, y, title, items):
@@ -494,14 +498,14 @@ class ZombieRenderer:
         for i, state in enumerate(self.history):
             if state.get("obs") is not None:
                 self.current_obs = state["obs"]
-            if state.get("skill_info") is not None:
-                self.skill_info = state["skill_info"]
             if not self.render_frame(
                 state["agent"], 
                 state["zombies"], 
                 shots=state.get("shots", []),
                 step=i,
-                kills=state.get("kills", 0)
+                kills=state.get("kills", 0),
+                herder=state.get("herder"),
+                zombie_health=state.get("zombie_health", 50)
             ):
                 break
             self.clock.tick(fps)
@@ -557,15 +561,15 @@ def run_zombie_renderer():
         # Run simulation
         obs = env.reset()
         renderer.set_observation(obs)
-        skill_info = {'points': unwrapped.skill_points, 'speed': unwrapped.move_speed_level, 'damage': unwrapped.damage_level}
-        renderer.set_skill_info(unwrapped.skill_points, unwrapped.move_speed_level, unwrapped.damage_level)
+        herder = getattr(unwrapped, 'herder', None)
         renderer.record_state(
             unwrapped.agent, 
             unwrapped.zombies, 
             unwrapped.projectiles, 
             obs,
             kills=unwrapped.kills,
-            skill_info=skill_info
+            herder=herder,
+            zombie_health=unwrapped.zombie_health
         )
         
         kills = 0
@@ -579,15 +583,16 @@ def run_zombie_renderer():
             terminated = done[0]
             
             renderer.set_observation(obs)
-            skill_info = {'points': unwrapped.skill_points, 'speed': unwrapped.move_speed_level, 'damage': unwrapped.damage_level}
-            renderer.set_skill_info(unwrapped.skill_points, unwrapped.move_speed_level, unwrapped.damage_level)
+            herder = getattr(unwrapped, 'herder', None)
+            
             renderer.record_state(
                 unwrapped.agent, 
                 unwrapped.zombies, 
                 unwrapped.projectiles, 
                 obs,
                 kills=unwrapped.kills,
-                skill_info=skill_info
+                herder=herder,
+                zombie_health=unwrapped.zombie_health
             )
             
             if terminated:

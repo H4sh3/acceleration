@@ -10,6 +10,7 @@ Controls:
     Z/C     - Rotate left/right (less fine, ±5°)
     X/V     - Rotate left/right (coarse, ±45°)
     Space   - Shoot
+    T       - Time travel (jump back 50 steps, one-time use)
     R       - Reset
     Escape  - Quit
 """
@@ -48,6 +49,7 @@ class ZombieGameRenderer:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 24)
         self.big_font = pygame.font.Font(None, 48)
+        self.time_travel_count = 0  # Track how many times time travel was used
     
     def world_to_screen(self, pos):
         """Convert world position to screen position (agent-centered camera)."""
@@ -191,8 +193,23 @@ class ZombieGameRenderer:
         move_hint = self.font.render("Move:", True, WHITE)
         self.screen.blit(move_hint, (toggle_x + 130, toggle_y))
         
+        # Time travel indicator
+        tt_available = not self.env.time_travel_used and len(self.env.state_history) > 0
+        tt_color = GREEN if tt_available else GRAY
+        tt_text = "T:TimeTravel" if tt_available else "T:Used"
+        time_travel_render = self.font.render(tt_text, True, tt_color)
+        self.screen.blit(time_travel_render, (250, toggle_y))
+        
+        # Time travel usage counter
+        tt_count_text = self.font.render(f"TT:{self.time_travel_count}", True, YELLOW if self.time_travel_count > 0 else WHITE)
+        self.screen.blit(tt_count_text, (360, toggle_y))
+        
+        # History size indicator
+        history_text = self.font.render(f"History:{len(self.env.state_history)}/{50}", True, WHITE)
+        self.screen.blit(history_text, (420, toggle_y))
+        
         # Controls hint
-        hint = self.font.render("WASD:move QE:1° ZC:5° XV:45° Space:shoot R:reset", True, GRAY)
+        hint = self.font.render("WASD:move QE:1° ZC:5° XV:45° Space:shoot T:time R:reset", True, GRAY)
         self.screen.blit(hint, (10, hud_y + 55))
         
         # Game over
@@ -223,6 +240,7 @@ def main():
     print("  Z/C - Less fine rotation (±5°)")
     print("  X/V - Coarse rotation (±45°)")
     print("  Space - Shoot")
+    print("  T - Time travel (jump back 50 steps)")
     print("  R - Reset")
     print("  Escape - Quit")
     print("=" * 40)
@@ -239,6 +257,7 @@ def main():
                     running = False
                 elif event.key == pygame.K_r:
                     obs, _ = env.reset()
+                    renderer.time_travel_count = 0  # Reset counter on new game
                     print(f"Reset! Starting new game...")
         
         # Build discrete action from key presses
@@ -246,29 +265,35 @@ def main():
         
         # Movement
         if keys[pygame.K_w] or keys[pygame.K_UP]:
-            action = 1  # Up
+            action = 1  # Forward
         elif keys[pygame.K_s] or keys[pygame.K_DOWN]:
-            action = 2  # Down
+            action = 2  # Backward
         elif keys[pygame.K_a] or keys[pygame.K_LEFT]:
-            action = 3  # Left
+            action = 3  # Strafe left
         elif keys[pygame.K_d] or keys[pygame.K_RIGHT]:
-            action = 4  # Right
+            action = 4  # Strafe right
         # Rotation
         elif keys[pygame.K_q]:
-            action = 5  # Fine rotate left
+            action = 6  # Fine rotate left
         elif keys[pygame.K_e]:
-            action = 6  # Fine rotate right
+            action = 7  # Fine rotate right
         elif keys[pygame.K_z]:
-            action = 7  # Less fine rotate left
+            action = 8  # Less fine rotate left
         elif keys[pygame.K_c]:
-            action = 8  # Less fine rotate right
+            action = 9  # Less fine rotate right
         elif keys[pygame.K_x]:
-            action = 9  # Coarse rotate left
+            action = 10  # Coarse rotate left
         elif keys[pygame.K_v]:
-            action = 10  # Coarse rotate right
+            action = 11  # Coarse rotate right
         # Shoot
         elif keys[pygame.K_SPACE]:
-            action = 11
+            action = 12  # Shoot
+        # Time travel
+        elif keys[pygame.K_t]:
+            if not env.time_travel_used and len(env.state_history) > 0:
+                renderer.time_travel_count += 1
+                print(f"TIME TRAVEL #{renderer.time_travel_count}! Jumping back {len(env.state_history)} steps...")
+            action = 16  # Time travel
         
         # Step environment
         if env.agent["alive"]:
